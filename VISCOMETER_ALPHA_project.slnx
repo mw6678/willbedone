@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="VISCOMETER_ALPHA_project/VISCOMETER_ALPHA_project.vcxproj" Id="7ea33a36-eeb4-4267-bf82-11b2d5b80366" />
+</Solution>
