@@ -1,3 +1,5 @@
+import csv
+from datetime import datetime
 import sys
 import os
 import serial
@@ -9,13 +11,22 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QRectF
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QPainter
 
+import sys
+import os
+
 # ==========================================
 # ⚙️ [사용자 설정 영역]
 # ==========================================
 BAUD_RATE = 9600  # 시리얼 통신 보드레이트 설정
 
-# 애플리케이션 파일이 위치한 디렉토리의 절대 경로 기준 로고 파일 지정
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# [수정된 부분] .exe 파일로 실행할 때와 파이썬으로 실행할 때의 경로를 똑같이 맞춰줍니다.
+if getattr(sys, 'frozen', False):
+    # .exe 로 실행된 경우 실행 파일이 있는 폴더 경로
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # 파이썬 스크립트로 실행된 경우 현재 파일 경로
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 LOGO_FILE = os.path.join(BASE_DIR, "logo2.png")
 
 
@@ -100,9 +111,12 @@ def get_air_quality_korea(pm25, pm10):
 # 🧵 [백그라운드 시리얼 통신 스레드]
 # UI 멈춤 현상을 방지하기 위해 별도 스레드에서 시리얼 데이터를 수신합니다.
 # ==========================================
+# ==========================================
+# 🧵 [백그라운드 시리얼 통신 및 엑셀(CSV) 자동 저장 스레드]
+# ==========================================
 class SerialThread(QThread):
     status_signal = pyqtSignal(str)          # 연결 상태 메시지 전달 시그널
-    data_signal = pyqtSignal(int, int, int)  # 측정된 미세먼지 데이터(PM1, PM2.5, PM10) 전달 시그널
+    data_signal = pyqtSignal(int, int, int)  # 측정된 미세먼지 데이터 전달 시그널
 
     def run(self):
         # 1. 포트 자동 검색 수행
@@ -112,6 +126,10 @@ class SerialThread(QThread):
             self.status_signal.emit("❌ 센서를 찾을 수 없습니다.")
             return
 
+        # 날짜별 파일 저장을 위한 변수 초기화
+        current_date = ""
+        file_path = ""
+
         try:
             # 2. 시리얼 포트 연결 시도
             ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
@@ -120,14 +138,43 @@ class SerialThread(QThread):
             # 3. 스레드가 중단될 때까지 반복 수신
             while not self.isInterruptionRequested():
                 if ser.in_waiting > 0:
-                    # 버퍼에서 데이터 읽기 및 디코딩
                     raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
-                    
-                    # 상단에 정의한 커스텀 파싱 함수 호출
                     pm1, pm25, pm10 = parse_custom_data(raw_data)
 
                     if pm1 is not None and pm25 is not None and pm10 is not None:
+                        # UI 화면 업데이트를 위해 시그널 전송
                         self.data_signal.emit(pm1, pm25, pm10)
+
+                        # ----------------------------------------------------
+                        # 💾 [엑셀(CSV) 파일 저장 로직 시작]
+                        # ----------------------------------------------------
+                        now = datetime.now()
+                        today_str = now.strftime("%Y-%m-%d") # 예: 2026-08-11
+                        time_str = now.strftime("%H:%M:%S")  # 예: 11:17:25
+
+                        # 날짜가 바뀌었거나 프로그램 실행 후 처음 저장하는 경우
+                        if current_date != today_str:
+                            current_date = today_str
+                            # 파일명 지정 (예: dust_log_2026-08-11.csv)
+                            file_path = os.path.join(BASE_DIR, f"Dust_log_{current_date}.csv")
+                            
+                            # 파일이 없다면 새로 만들고 최상단에 헤더(제목) 작성
+                            is_new_file = not os.path.exists(file_path)
+                            if is_new_file:
+                                # utf-8-sig 인코딩을 사용하면 엑셀에서 한글이 깨지지 않습니다.
+                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                    writer = csv.writer(f)
+                                    writer.writerow(["측정일자", "측정시간", "PM 1.0", "PM 2.5", "PM 10"])
+
+                        # 매번 수신된 데이터를 파일의 맨 마지막 줄에 추가(Append)
+                        try:
+                            with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                writer = csv.writer(f)
+                                writer.writerow([today_str, time_str, pm1, pm25, pm10])
+                        except PermissionError:
+                            # 만약 사용자가 해당 엑셀 파일을 띄워놓고 있어서 저장이 막힌 경우 예외 처리
+                            pass
+                        # ----------------------------------------------------
                 
                 # CPU 과부하 방지를 위한 미세 대기
                 QThread.msleep(100) 
@@ -135,7 +182,6 @@ class SerialThread(QThread):
         except serial.SerialException:
             self.status_signal.emit(f"❌ 포트({port_name}) 접근 거부됨 (사용중)")
         finally:
-            # 안전한 포트 닫기
             if 'ser' in locals() and ser.is_open:
                 ser.close()
 
