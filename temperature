@@ -1,0 +1,389 @@
+import csv
+from datetime import datetime
+import sys
+import os
+import serial
+import serial.tools.list_ports
+import time
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
+from PyQt5.QtGui import QFont
+
+# ==========================================
+# ⚙️ [사용자 설정 영역]
+# ==========================================
+BAUD_RATE = 9600
+
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 📊 6단계 레벨 기준 설정 (원하시는 기준치로 min/max 값을 수정하세요)
+# 온습도의 경우 너무 낮아도 나쁘지만, 게이지바 특성상(왼쪽->오른쪽 진행)
+# 이미지의 화살표 위치(낮은 수치 = 녹색)를 반영하여 점진적으로 증가하도록 기본값을 잡았습니다.
+TEMP_LEVELS = [
+    {"name": "매우 추움", "min": -200.0, "max": 15.9, "color": "#28A745"},      # 초록
+    {"name": "추움", "min": 16.0, "max": 18.9, "color": "#FFD700"},      # 노랑
+    {"name": "쾌적", "min": 19.0, "max": 22.9, "color": "#FD7E14"},      # 주황
+    {"name": "따듯함", "min": 23.0, "max": 26.9, "color": "#DC3545"},      # 빨강
+    {"name": "더움", "min": 27.0, "max": 29.9, "color": "#800080"},   # 보라
+    {"name": "매우 더움", "min": 31.0, "max": 200.0, "color": "#795548"},      # 갈색
+]
+
+HUMI_LEVELS = [
+    {"name": "매우 건조", "min": 0, "max": 29, "color": "#28A745"},
+    {"name": "건조", "min": 30, "max": 39, "color": "#FFD700"},
+    {"name": "쾌적", "min": 40, "max": 59, "color": "#FD7E14"},
+    {"name": "다소 습함", "min": 60, "max": 69, "color": "#DC3545"},
+    {"name": "습함", "min": 70, "max": 79, "color": "#800080"},
+    {"name": "매우 습함", "min": 80, "max": 1000, "color": "#795548"},
+]
+
+# ==========================================
+# 📥 [수신 데이터 파싱 및 보정 영역] (★여기서 수정하세요★)
+# ==========================================
+def parse_custom_data(raw_data):
+    """콤마(,)로 구분된 2개의 데이터를 파싱하고 필요시 수치를 보정합니다."""
+    try:
+        parts = raw_data.replace(" ", "").split(',')
+        if len(parts) >= 2:
+            
+            # 1️⃣ 센서에서 들어오는 순서 설정
+            # 첫 번째 값(parts[0]) = 온도 / 두 번째 값(parts[1]) = 습도 
+            raw_temp = float(parts[0])
+            raw_humi = float(parts[1])
+            
+            # 2️⃣ 데이터 수치 보정 (가중치 / 오프셋)
+            # 온도는 소수점 1자리까지(float), 습도는 정수(int)로 처리합니다.
+            temp = raw_temp * 1.0       # 온도 보정
+            humi = int(raw_humi * 1.0)  # 습도 보정
+            
+            return temp, humi
+            
+    except (ValueError, IndexError):
+        pass
+    
+    return None, None
+
+
+# ==========================================
+# 🔍 [자동 포트 검색 (온습도 전용)]
+# ==========================================
+def auto_detect_port():
+    """데이터가 정확히 '2개'씩 들어오는 포트를 온습도 센서로 인식합니다."""
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        try:
+            with serial.Serial(port.device, BAUD_RATE, timeout=2) as ser:
+                for _ in range(3):
+                    raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
+                    if raw_data:
+                        parts = raw_data.replace(" ", "").split(',')
+                        
+                        # 💡 CO2(1개)나 미세먼지(3개 이상)와 구분하기 위해 길이를 2로 제한
+                        if len(parts) == 2:
+                            try:
+                                float(parts[0])
+                                float(parts[1])
+                                return port.device # 데이터가 정상적인 2개면 포트 확정!
+                            except ValueError:
+                                pass
+        except serial.SerialException:
+            pass
+            
+    return None
+
+
+# ==========================================
+# 🧵 [백그라운드 시리얼 통신 스레드]
+# ==========================================
+class SerialThread(QThread):
+    # 온도(float), 습도(int) 전달 시그널
+    data_signal = pyqtSignal(float, int) 
+
+    def run(self):
+        port_name = auto_detect_port()
+        if port_name is None:
+            return
+
+        current_date = ""
+        file_path = ""
+
+        try:
+            ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
+            while not self.isInterruptionRequested():
+                if ser.in_waiting > 0:
+                    raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
+                    
+                    temp, humi = parse_custom_data(raw_data)
+
+                    if temp is not None and humi is not None:
+                        # UI 업데이트 
+                        self.data_signal.emit(temp, humi)
+                        
+                        # CSV 자동 저장 
+                        now = datetime.now()
+                        today_str = now.strftime("%Y-%m-%d")
+                        time_str = now.strftime("%H:%M:%S")
+
+                        if current_date != today_str:
+                            current_date = today_str
+                            file_path = os.path.join(BASE_DIR, f"TempHumi_log_{current_date}.csv")
+                            if not os.path.exists(file_path):
+                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                    writer = csv.writer(f)
+                                    writer.writerow(["측정일자", "측정시간", "온도 (℃)", "습도 (%)"])
+
+                        try:
+                            with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                writer = csv.writer(f)
+                                writer.writerow([today_str, time_str, temp, humi])
+                        except PermissionError:
+                            pass
+                QThread.msleep(100) 
+
+        except serial.SerialException:
+            pass
+        finally:
+            if 'ser' in locals() and ser.is_open:
+                ser.close()
+
+
+# ==========================================
+# 🖥️ [개별 센서 표시 UI 위젯]
+# ==========================================
+class SensorLevelWidget(QFrame):
+    def __init__(self, title, unit, levels, decimal_places=0, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.unit = unit
+        self.LEVELS = levels
+        self.decimal_places = decimal_places # 소수점 표시 여부 (온도=1, 습도=0)
+        self.current_value = 0 
+        self.initUI()
+
+    def initUI(self):
+        self.setStyleSheet("""
+            QFrame { 
+                background-color: white; 
+                border: 2px solid #E0E0E0; 
+                border-radius: 12px; 
+            }
+            QLabel { border: none; } 
+        """)
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(5)
+
+        # 1. 타이틀
+        title_label = QLabel(self.title)
+        title_label.setFont(QFont("Malgun Gothic", 18, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: black;")
+        main_layout.addWidget(title_label)
+        
+        main_layout.addSpacing(10)
+
+        # 2. 수치 및 단위 
+        value_layout = QHBoxLayout()
+        value_layout.setAlignment(Qt.AlignCenter)
+        value_layout.setSpacing(2)
+
+        self.value_label = QLabel("----")
+        self.value_label.setFont(QFont("Arial", 42, QFont.Bold))
+        self.value_label.setStyleSheet("color: black;")
+        value_layout.addWidget(self.value_label)
+
+        unit_label = QLabel(self.unit)
+        unit_label.setFont(QFont("Arial", 16, QFont.Bold))
+        unit_label.setStyleSheet("color: black; margin-bottom: 8px;")
+        unit_label.setAlignment(Qt.AlignBottom)
+        value_layout.addWidget(unit_label)
+
+        main_layout.addLayout(value_layout)
+        main_layout.addSpacing(5)
+
+        # 3. 화살표 
+        self.arrow_container = QWidget()
+        self.arrow_container.setFixedHeight(20)
+        self.arrow_container.setStyleSheet("border: none;")
+        
+        self.arrow_label = QLabel("▼")
+        self.arrow_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.arrow_label.setStyleSheet("color: black; border: none;")
+        self.arrow_label.setAlignment(Qt.AlignCenter)
+        self.arrow_label.setFixedWidth(20)
+        self.arrow_label.setParent(self.arrow_container)
+        
+        main_layout.addWidget(self.arrow_container)
+
+        # 4. 게이지 바
+        level_bar_frame = QFrame()
+        level_bar_frame.setStyleSheet("border: none;")
+        self.level_bar_layout = QHBoxLayout(level_bar_frame)
+        self.level_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.level_bar_layout.setSpacing(2)
+
+        self.level_bars = []
+        for i, level in enumerate(self.LEVELS):
+            bar = QFrame()
+            bar.setFixedHeight(12)
+            
+            border_radius = ""
+            if i == 0:
+                border_radius = "border-top-left-radius: 6px; border-bottom-left-radius: 6px;"
+            elif i == len(self.LEVELS) - 1:
+                border_radius = "border-top-right-radius: 6px; border-bottom-right-radius: 6px;"
+                
+            bar.setStyleSheet(f"background-color: {level['color']}; {border_radius} border: none;")
+            self.level_bars.append(bar)
+            self.level_bar_layout.addWidget(bar)
+
+        main_layout.addWidget(level_bar_frame)
+        main_layout.addSpacing(15)
+
+        # 5. 상태 텍스트 
+        self.status_text_label = QLabel("대기 중...")
+        self.status_text_label.setFont(QFont("Malgun Gothic", 16, QFont.Bold))
+        self.status_text_label.setAlignment(Qt.AlignCenter)
+        self.status_text_label.setFixedHeight(45)
+        self.status_text_label.setStyleSheet("background-color: #E0E0E0; border-radius: 8px; color: gray; border: none;")
+        
+        main_layout.addWidget(self.status_text_label)
+        main_layout.addStretch(1)
+
+    def update_value(self, value):
+        self.current_value = value
+        
+        # 소수점 표시 여부에 따라 포맷팅 (온도는 1자리, 습도는 정수)
+        if self.decimal_places == 0:
+            self.value_label.setText(f"{int(value)}")
+        else:
+            self.value_label.setText(f"{value:.{self.decimal_places}f}")
+
+        current_level = None
+        for level in self.LEVELS:
+            if value <= level['max']:
+                current_level = level
+                break
+        
+        if value < self.LEVELS[0]['min']: current_level = self.LEVELS[0]
+        elif value > self.LEVELS[-1]['max']: current_level = self.LEVELS[-1]
+
+        if current_level:
+            self.status_text_label.setText(current_level['name'])
+            color = current_level['color']
+            
+            text_color = "black" if current_level['name'] == "보통" else "white"
+            self.status_text_label.setStyleSheet(f"background-color: {color}; border-radius: 8px; color: {text_color}; border: none;")
+
+        self.update_arrow_position()
+
+    def update_arrow_position(self):
+        if not self.level_bars or self.level_bars[0].geometry().width() == 0:
+            return 
+
+        value = self.current_value
+        
+        level_index = 0
+        for i, level in enumerate(self.LEVELS):
+            if value <= level['max']:
+                level_index = i
+                break
+        else:
+            level_index = len(self.LEVELS) - 1
+
+        current_level = self.LEVELS[level_index]
+        level_min = current_level['min']
+        level_max = current_level['max']
+
+        if value <= level_min: ratio = 0.0
+        elif value >= level_max: ratio = 1.0
+        else: ratio = (value - level_min) / (level_max - level_min)
+
+        target_bar = self.level_bars[level_index]
+        bar_x = target_bar.geometry().x()
+        bar_width = target_bar.geometry().width()
+
+        target_x = bar_x + (bar_width * ratio)
+        arrow_x = target_x - (self.arrow_label.width() / 2)
+        arrow_y = self.arrow_container.height() - self.arrow_label.height()
+
+        self.arrow_label.move(QPoint(int(arrow_x), int(arrow_y)))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_arrow_position()
+
+
+# ==========================================
+# 🔍 [메인 어플리케이션 및 윈도우 클래스]
+# ==========================================
+class TempHumiMonitorApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+        self.start_thread()
+        self.dragPos = QPoint()
+
+    def initUI(self):
+        self.setWindowTitle("온습도 모니터링")
+        self.resize(500, 300)  # 2개가 나란히 들어가도록 너비 조절
+        self.setStyleSheet("QMainWindow { background-color: white; border: 1px solid #CCCCCC;}")
+        
+        self.setWindowFlags(Qt.FramelessWindowHint)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
+
+        # 이미지 순서에 맞춰 왼쪽=습도(정수), 오른쪽=온도(소수점 1자리)
+        self.humi_widget = SensorLevelWidget("습도", "%", HUMI_LEVELS, decimal_places=0)
+        self.temp_widget = SensorLevelWidget("온도", "℃", TEMP_LEVELS, decimal_places=1)
+
+        # 레이아웃에 추가 (좌: 습도, 우: 온도)
+        main_layout.addWidget(self.humi_widget)
+        main_layout.addWidget(self.temp_widget)
+
+    def start_thread(self):
+        self.serial_thread = SerialThread()
+        self.serial_thread.data_signal.connect(self.update_data)
+        self.serial_thread.start()
+
+    def update_data(self, temp, humi):
+        # 각각의 위젯 업데이트
+        self.temp_widget.update_value(temp)
+        self.humi_widget.update_value(humi)
+
+    def closeEvent(self, event):
+        if hasattr(self, 'serial_thread'):
+            self.serial_thread.requestInterruption()
+            self.serial_thread.wait()
+        event.accept()
+
+    # ==========================================
+    # 🖱️ [마우스 드래그 및 종료 기능]
+    # ==========================================
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragPos = event.globalPos()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            self.move(self.pos() + event.globalPos() - self.dragPos)
+            self.dragPos = event.globalPos()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = TempHumiMonitorApp()
+    window.show()
+    sys.exit(app.exec_())
