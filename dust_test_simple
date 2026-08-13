@@ -1,0 +1,424 @@
+import csv
+from datetime import datetime
+import sys
+import os
+import serial
+import serial.tools.list_ports
+import time
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
+from PyQt5.QtGui import QFont, QColor
+
+# ==========================================
+# ⚙️ [사용자 설정 영역]
+# ==========================================
+BAUD_RATE = 9600
+
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 📊 6단계 레벨 기준 설정 (원하시는 기준치로 min/max 값을 수정하세요)
+PM10_LEVELS = [
+    {"name": "좋음", "min": 0, "max": 10, "color": "#28A745"},        # 초록
+    {"name": "보통", "min": 11, "max": 15, "color": "#FFD700"},       # 노랑
+    {"name": "민감군", "min": 15, "max": 25, "color": "#FD7E14"},     # 주황
+    {"name": "나쁨", "min": 26, "max": 35, "color": "#DC3545"},       # 빨강
+    {"name": "매우 나쁨", "min": 36, "max": 50, "color": "#800080"},  # 보라
+    {"name": "위험", "min": 50, "max": 500, "color": "#795548"},      # 갈색
+]
+
+PM25_LEVELS = [
+    {"name": "좋음", "min": 0, "max": 20, "color": "#28A745"},
+    {"name": "보통", "min": 21, "max": 30, "color": "#FFD700"},
+    {"name": "민감군", "min": 31, "max": 50, "color": "#FD7E14"},
+    {"name": "나쁨", "min": 51, "max": 75, "color": "#DC3545"},
+    {"name": "매우 나쁨", "min": 76, "max": 100, "color": "#800080"},
+    {"name": "위험", "min": 101, "max": 500, "color": "#795548"},
+]
+
+PM1_LEVELS = [
+    {"name": "좋음", "min": 0, "max": 5, "color": "#28A745"},
+    {"name": "보통", "min": 6, "max": 10, "color": "#FFD700"},
+    {"name": "민감군", "min": 11, "max": 20, "color": "#FD7E14"},
+    {"name": "나쁨", "min": 21, "max": 30, "color": "#DC3545"},
+    {"name": "매우 나쁨", "min": 31, "max": 50, "color": "#800080"},
+    {"name": "위험", "min": 51, "max": 200, "color": "#795548"},
+]
+
+# ==========================================
+# 📥 [수신 데이터 파싱 및 보정 영역] (★여기서 수정하세요★)
+# ==========================================
+def parse_custom_data(raw_data):
+    """콤마(,)로 구분된 3개의 데이터를 파싱하고 필요시 수치를 보정합니다."""
+    try:
+        parts = raw_data.replace(" ", "").split(',')
+        if len(parts) >= 3:
+            
+            # 1️⃣ 센서에서 들어오는 순서 설정
+            # 현재: 첫번째(parts[0])=PM1.0, 두번째(parts[1])=PM2.5, 세번째(parts[2])=PM10
+            # 순서가 다르다면 아래 0, 1, 2 숫자의 위치를 바꿔주세요.
+            raw_pm10 = float(parts[0])
+            raw_pm25 = float(parts[1])
+            raw_pm1 = float(parts[2])
+            
+            # 2️⃣ 데이터 수치 보정 (가중치 / 오프셋)
+            # 수치가 안 맞으면 곱하기(*)나 더하기(+)를 추가하세요.
+            # 예) pm25가 5 높게 나오면: int(raw_pm25 * 1.0 - 5)
+            pm10 = int(raw_pm1 * 1.0)
+            pm25 = int(raw_pm25 * 1.0)
+            pm1 = int(raw_pm10 * 1.0)
+            
+            # 변환된 값 3개를 스레드로 전달
+            return pm10, pm25, pm1
+            
+    except (ValueError, IndexError):
+        pass
+    
+    return None, None, None
+
+
+# ==========================================
+# 🔍 [미세먼지 전용 자동 포트 검색]
+# ==========================================
+def auto_detect_port():
+    """시스템에 연결된 포트들을 하나씩 열어보고, 데이터가 3개씩 들어오는 포트를 찾습니다."""
+    ports = serial.tools.list_ports.comports()
+    
+    for port in ports:
+        try:
+            # 포트를 임시로 열어서 데이터 확인 (타임아웃 설정)
+            with serial.Serial(port.device, BAUD_RATE, timeout=2) as ser:
+                # 통신을 시작하자마자 읽으면 데이터가 중간부터 잘려 들어올 수 있으므로,
+                # 최대 3줄(3번)까지 읽어보면서 정상적인 형태인지 테스트합니다.
+                for _ in range(3):
+                    raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
+                    
+                    if raw_data:
+                        parts = raw_data.replace(" ", "").split(',')
+                        
+                        # 💡 콤마로 구분된 데이터가 3개 이상인지 확인
+                        if len(parts) >= 3:
+                            try:
+                                # 정상적인 숫자로 변환이 가능한지 테스트
+                                float(parts[0])
+                                float(parts[1])
+                                float(parts[2])
+                                
+                                # 모든 조건을 통과하면 이 포트가 미세먼지 센서가 맞음!
+                                return port.device 
+                            except ValueError:
+                                pass
+        except serial.SerialException:
+            # 이미 다른 프로그램(예: CO2 프로그램)이 사용 중이거나 
+            # 접근 권한이 없는 포트는 무시하고 다음 포트로 넘어갑니다.
+            pass
+            
+    return None # 맞는 포트를 찾지 못한 경우
+
+
+# ==========================================
+# 🧵 [백그라운드 시리얼 통신 및 CSV 자동저장 스레드]
+# ==========================================
+class SerialThread(QThread):
+    # 3개의 정수형 데이터(PM10, PM2.5, PM1)를 UI로 보내는 시그널
+    data_signal = pyqtSignal(int, int, int) 
+
+    def run(self):
+        port_name = auto_detect_port()
+        if port_name is None:
+            return
+
+        current_date = ""
+        file_path = ""
+
+        try:
+            ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
+            while not self.isInterruptionRequested():
+                if ser.in_waiting > 0:
+                    raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
+                    
+                    # 파싱 함수를 통해 3개의 값 받아오기
+                    pm1, pm25, pm10 = parse_custom_data(raw_data)
+
+                    # 정상적으로 데이터가 파싱되었다면
+                    if pm1 is not None and pm25 is not None and pm10 is not None:
+                        # 1. UI 업데이트 시그널 전송
+                        self.data_signal.emit(pm1, pm25, pm10)
+                        
+                        # 2. CSV 파일 자동 저장 로직
+                        now = datetime.now()
+                        today_str = now.strftime("%Y-%m-%d")
+                        time_str = now.strftime("%H:%M:%S")
+
+                        if current_date != today_str:
+                            current_date = today_str
+                            file_path = os.path.join(BASE_DIR, f"Dust_log_{current_date}.csv")
+                            if not os.path.exists(file_path):
+                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                    writer = csv.writer(f)
+                                    writer.writerow(["측정일자", "측정시간", "PM 10", "PM 2.5", "PM 1.0"])
+
+                        try:
+                            with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                writer = csv.writer(f)
+                                writer.writerow([today_str, time_str, pm10, pm25, pm1])
+                        except PermissionError:
+                            pass
+                
+                QThread.msleep(100) 
+
+        except serial.SerialException:
+            pass
+        finally:
+            if 'ser' in locals() and ser.is_open:
+                ser.close()
+
+
+# ==========================================
+# 🖥️ [개별 미세먼지 표시 UI 위젯]
+# ==========================================
+class DustLevelWidget(QFrame):
+    def __init__(self, title, unit, levels, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.unit = unit
+        self.LEVELS = levels
+        self.current_value = 0 
+        self.initUI()
+
+    def initUI(self):
+        # 개별 위젯 테두리 및 둥근 모서리 설정
+        self.setStyleSheet("""
+            QFrame { 
+                background-color: white; 
+                border: 2px solid #E0E0E0; 
+                border-radius: 12px; 
+            }
+            QLabel { border: none; } /* 내부 라벨은 테두리 없음 */
+        """)
+        
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(5)
+
+        # 1. 타이틀
+        title_label = QLabel(self.title)
+        title_label.setFont(QFont("Malgun Gothic", 18, QFont.Bold))
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("color: black;")
+        main_layout.addWidget(title_label)
+        
+        main_layout.addSpacing(10)
+
+        # 2. 수치 및 단위 레이아웃
+        value_layout = QHBoxLayout()
+        value_layout.setAlignment(Qt.AlignCenter)
+        value_layout.setSpacing(2)
+
+        self.value_label = QLabel("----")
+        self.value_label.setFont(QFont("Arial", 40, QFont.Bold))
+        self.value_label.setStyleSheet("color: black;")
+        value_layout.addWidget(self.value_label)
+
+        unit_label = QLabel(self.unit)
+        unit_label.setFont(QFont("Arial", 14, QFont.Bold))
+        unit_label.setStyleSheet("color: black; margin-bottom: 8px;")
+        unit_label.setAlignment(Qt.AlignBottom)
+        value_layout.addWidget(unit_label)
+
+        main_layout.addLayout(value_layout)
+        main_layout.addSpacing(5)
+
+        # 3. 화살표 컨테이너
+        self.arrow_container = QWidget()
+        self.arrow_container.setFixedHeight(20)
+        self.arrow_container.setStyleSheet("border: none;")
+        
+        self.arrow_label = QLabel("▼")
+        self.arrow_label.setFont(QFont("Arial", 12, QFont.Bold))
+        self.arrow_label.setStyleSheet("color: black; border: none;")
+        self.arrow_label.setAlignment(Qt.AlignCenter)
+        self.arrow_label.setFixedWidth(20)
+        self.arrow_label.setParent(self.arrow_container)
+        
+        main_layout.addWidget(self.arrow_container)
+
+        # 4. 게이지 바
+        level_bar_frame = QFrame()
+        level_bar_frame.setStyleSheet("border: none;")
+        self.level_bar_layout = QHBoxLayout(level_bar_frame)
+        self.level_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.level_bar_layout.setSpacing(2)
+
+        self.level_bars = []
+        for i, level in enumerate(self.LEVELS):
+            bar = QFrame()
+            bar.setFixedHeight(12)
+            
+            border_radius = ""
+            if i == 0:
+                border_radius = "border-top-left-radius: 6px; border-bottom-left-radius: 6px;"
+            elif i == len(self.LEVELS) - 1:
+                border_radius = "border-top-right-radius: 6px; border-bottom-right-radius: 6px;"
+                
+            bar.setStyleSheet(f"background-color: {level['color']}; {border_radius} border: none;")
+            self.level_bars.append(bar)
+            self.level_bar_layout.addWidget(bar)
+
+        main_layout.addWidget(level_bar_frame)
+        main_layout.addSpacing(15)
+
+        # 5. 상태 텍스트 블록
+        self.status_text_label = QLabel("대기 중...")
+        self.status_text_label.setFont(QFont("Malgun Gothic", 16, QFont.Bold))
+        self.status_text_label.setAlignment(Qt.AlignCenter)
+        self.status_text_label.setFixedHeight(45)
+        self.status_text_label.setStyleSheet("background-color: #E0E0E0; border-radius: 8px; color: gray; border: none;")
+        
+        main_layout.addWidget(self.status_text_label)
+        main_layout.addStretch(1)
+
+    def update_value(self, value):
+        """수치를 받고 UI(텍스트, 색상, 화살표)를 갱신합니다."""
+        self.current_value = value
+        self.value_label.setText(str(value))
+
+        current_level = None
+        for level in self.LEVELS:
+            if value <= level['max']:
+                current_level = level
+                break
+        
+        if value < self.LEVELS[0]['min']: current_level = self.LEVELS[0]
+        elif value > self.LEVELS[-1]['max']: current_level = self.LEVELS[-1]
+
+        if current_level:
+            self.status_text_label.setText(current_level['name'])
+            color = current_level['color']
+            
+            # 노란색(보통)인 경우만 글씨를 검은색으로, 나머지는 흰색으로
+            text_color = "black" if current_level['name'] == "보통" else "white"
+            self.status_text_label.setStyleSheet(f"background-color: {color}; border-radius: 8px; color: {text_color}; border: none;")
+
+        self.update_arrow_position()
+
+    def update_arrow_position(self):
+        """현재 수치 비율을 계산해 화살표를 정확한 위치로 이동시킵니다."""
+        if not self.level_bars or self.level_bars[0].geometry().width() == 0:
+            return 
+
+        value = self.current_value
+        
+        level_index = 0
+        for i, level in enumerate(self.LEVELS):
+            if value <= level['max']:
+                level_index = i
+                break
+        else:
+            level_index = len(self.LEVELS) - 1
+
+        current_level = self.LEVELS[level_index]
+        level_min = current_level['min']
+        level_max = current_level['max']
+
+        if value <= level_min: ratio = 0.0
+        elif value >= level_max: ratio = 1.0
+        else: ratio = (value - level_min) / (level_max - level_min)
+
+        target_bar = self.level_bars[level_index]
+        bar_x = target_bar.geometry().x()
+        bar_width = target_bar.geometry().width()
+
+        target_x = bar_x + (bar_width * ratio)
+        arrow_x = target_x - (self.arrow_label.width() / 2)
+        arrow_y = self.arrow_container.height() - self.arrow_label.height()
+
+        self.arrow_label.move(QPoint(int(arrow_x), int(arrow_y)))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.update_arrow_position()
+
+
+# ==========================================
+# 🔍 [메인 어플리케이션 및 윈도우 클래스]
+# ==========================================
+class DustMonitorApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.initUI()
+        self.start_thread()
+        self.dragPos = QPoint()
+
+    def initUI(self):
+        self.setWindowTitle("미세먼지 통합 모니터링")
+        self.resize(750, 320)  # 3개가 나란히 들어갈 수 있는 넉넉한 창 크기
+        self.setStyleSheet("QMainWindow { background-color: white; border: 1px solid #CCCCCC;}")
+        
+        # 상단 타이틀바 제거
+        self.setWindowFlags(Qt.FramelessWindowHint)
+
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+
+        # 메인 레이아웃을 가로 배치(QHBoxLayout)로 설정
+        main_layout = QHBoxLayout(central_widget)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        main_layout.setSpacing(15)
+
+        # 3개의 개별 위젯 생성 (미세먼지, 초미세먼지, 극미세먼지)
+        self.pm1_widget = DustLevelWidget("미세먼지(PM10)", "µg/m³", PM10_LEVELS)
+        self.pm25_widget = DustLevelWidget("초미세먼지(PM2.5)", "µg/m³", PM25_LEVELS)
+        self.pm10_widget = DustLevelWidget("극미세먼지(PM1)", "µg/cm³", PM1_LEVELS)
+
+        # 레이아웃에 가로로 순서대로 추가
+        main_layout.addWidget(self.pm1_widget)
+        main_layout.addWidget(self.pm25_widget)
+        main_layout.addWidget(self.pm10_widget)
+
+    def start_thread(self):
+        self.serial_thread = SerialThread()
+        self.serial_thread.data_signal.connect(self.update_data)
+        self.serial_thread.start()
+
+    def update_data(self, pm10, pm25, pm1):
+        # 스레드에서 받은 3개의 수치를 각각의 UI 위젯으로 전송하여 업데이트
+        self.pm10_widget.update_value(pm10)
+        self.pm25_widget.update_value(pm25)
+        self.pm1_widget.update_value(pm1)
+
+    def closeEvent(self, event):
+        if hasattr(self, 'serial_thread'):
+            self.serial_thread.requestInterruption()
+            self.serial_thread.wait()
+        event.accept()
+
+    # ==========================================
+    # 🖱️ [마우스 드래그 창 이동 기능]
+    # ==========================================
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.dragPos = event.globalPos()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            self.move(self.pos() + event.globalPos() - self.dragPos)
+            self.dragPos = event.globalPos()
+
+    # ==========================================
+    # ⌨️ [ESC 키 종료 기능]
+    # ==========================================
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+
+# ==========================================
+# 🚀 [프로그램 실행 진입점]
+# ==========================================
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    window = DustMonitorApp()
+    window.show()
+    sys.exit(app.exec_())
