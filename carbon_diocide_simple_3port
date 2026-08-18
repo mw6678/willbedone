@@ -4,6 +4,7 @@ import sys
 import os
 import serial
 import time
+import re
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont
@@ -15,7 +16,7 @@ BAUD_RATE = 9600
 
 # 여기에 장치 관리자에서 확인한 COM 포트 번호 3개를 적어주세요!
 # (만약 2개만 쓴다면 ["COM3", "COM4"] 까지만 적으셔도 됩니다.)
-TARGET_PORTS = ["COM3", "COM4", "COM5"] 
+TARGET_PORTS = ["COM3", "COM4", "COM9"] 
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -23,53 +24,54 @@ else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ==========================================
-#  [수신 데이터 파싱 - 센서별 개별 수정]
+#  [수신 데이터 파싱 - 센서별 보정값 적용 및 예외 처리]
 # ==========================================
 def parse_custom_data(raw_data, sensor_index):
-    """
-    각 포트에서 들어오는 데이터를 센서별로 다르게 처리합니다.
-    - sensor_index 0: TARGET_PORTS의 첫 번째 포트 (예: COM3)
-    - sensor_index 1: TARGET_PORTS의 두 번째 포트 (예: COM4)
-    - sensor_index 2: TARGET_PORTS의 세 번째 포트 (예: COM5)
-    """
+    # 1. 데이터가 비어있으면 바로 무시
+    if not raw_data:
+        return None
+
     try:
+        # 2. 정규식으로 '문자열 내의 모든 숫자(소수점 포함)'만 리스트로 추출
+        numbers = re.findall(r"[-+]?\d*\.\d+|\d+", raw_data)
+
+        # 숫자가 하나도 못 뽑혔으면 쓰레기값이므로 버림
+        if not numbers:
+            return None
+
+        # 일단 문자열에서 뽑아낸 첫 번째 숫자를 소수점(float) 형태로 가져옵니다.
+        raw_co2 = float(numbers[0]) 
+        co2_value = None
+
         # ----------------------------------------
-        #  1번 센서 파싱 로직
+        # 💡 센서별 파싱값(보정) 수정 영역
         # ----------------------------------------
         if sensor_index == 0:
-            parts = raw_data.replace(" ", "").split(',')
-            if parts:
-                row_co2 = int(float(parts[0]))   #데이터 소수점 에러 방지
-                co2 = int(row_co2 * 1.0)         #데이터 1 파싱값 수정
-                return co2
-                
-        # ----------------------------------------
-        #  2번 센서 파싱 로직
-        # ----------------------------------------
-        elif sensor_index == 1:
-            # 예시: 만약 2번 센서는 데이터가 "CO2:400" 형태로 들어온다면?
-            # parts = raw_data.replace("CO2:", "")
-            # return int(float(parts))
-            
-            parts = raw_data.replace(" ", "").split(',')
-            if parts:
-                row_co2 = int(float(parts[0]))    #데이터 소수점 에러 방지
-                co2 = int(row_co2 * 1.0)          #데이터 2 파싱값 수정
-                return co2
-        # ----------------------------------------
-        #  3번 센서 파싱 로직
-        # ----------------------------------------
-        elif sensor_index == 2:
-            # 예시: 만약 3번 센서는 콤마 없이 숫자만 "400" 들어온다면?
-            # return int(float(raw_data))
-            
-            parts = raw_data.replace(" ", "").split(',')
-            if parts:
-                row_co2 = int(float(parts[0]))    #데이터 소수점 에러 방지
-                co2 = int(row_co2 * 1.0)          #데이터 3 파싱값 수정
-                return co2
+            # 1번 센서 보정: 곱하기, 더하기 등을 자유롭게 하세요.
+            calibrated_co2 = raw_co2 * 1.0  # 데이터 1 파싱값 수정
+            co2_value = int(calibrated_co2)
 
-    except (ValueError, IndexError):
+        elif sensor_index == 1:
+            # 2번 센서 보정
+            calibrated_co2 = raw_co2 * 1.0  # 데이터 2 파싱값 수정
+            co2_value = int(calibrated_co2)
+
+        elif sensor_index == 2:
+            # 3번 센서 보정
+            calibrated_co2 = raw_co2 * 1.0  # 데이터 3 파싱값 수정
+            co2_value = int(calibrated_co2)
+
+        # ----------------------------------------
+        # 3. 🛡️ 논리적 범위 필터링 (Safety Check)
+        # ----------------------------------------
+        if co2_value is not None:
+            # 상식적인 CO2 범위를 벗어나면 통신 에러/노이즈로 간주하고 무시
+            if co2_value < 0 or co2_value > 10000:
+                return None  
+            return co2_value
+
+    except Exception:
+        # 데이터 처리 중 에러가 나더라도 프로그램이 죽지 않음
         pass
         
     return None
@@ -78,9 +80,7 @@ def parse_custom_data(raw_data, sensor_index):
 #  [백그라운드 개별 통신 스레드]
 # ==========================================
 class SerialThread(QThread):
-    # 시그널: (센서 인덱스, CO2 값)
     data_signal = pyqtSignal(int, int)
-    # 에러 시그널: (센서 인덱스, 에러 메시지)
     error_signal = pyqtSignal(int, str)
 
     def __init__(self, port_name, sensor_index):
@@ -91,50 +91,76 @@ class SerialThread(QThread):
     def run(self):
         current_date = ""
         file_path = ""
+        last_save_time = 0  # CSV 저장 주기를 관리하기 위한 변수
 
-        try:
-            # 지정된 포트 열기 시도
-            ser = serial.Serial(self.port_name, BAUD_RATE, timeout=1)
-            
-            while not self.isInterruptionRequested():
-                if ser.in_waiting > 0:
-                    raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
-                    co2 = parse_custom_data(raw_data)
+        # 스레드가 강제 종료되지 않는 한 무한 반복 (자동 재연결을 위해)
+        while not self.isInterruptionRequested():
+            try:
+                # 포트 열기 시도
+                ser = serial.Serial(self.port_name, BAUD_RATE, timeout=1)
+                
+                # 포트가 정상적으로 열려있는 동안 반복
+                while ser.is_open and not self.isInterruptionRequested():
+                    # 💡 [문제 해결 2] 버퍼에 쌓인 데이터를 한 번에 모두 읽어 최신 상태 유지
+                    co2_value = None
+                    while ser.in_waiting > 0:
+                        raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
+                        parsed = parse_custom_data(raw_data, self.sensor_index)
+                        if parsed is not None:
+                            co2_value = parsed
 
-                    if co2 is not None:
-                        # 메인 스레드로 데이터 전송
-                        self.data_signal.emit(self.sensor_index, co2)
-                        
-                        # 센서별 개별 CSV 저장
-                        now = datetime.now()
-                        today_str = now.strftime("%Y-%m-%d")
-                        time_str = now.strftime("%H:%M:%S")
+                    # 유효한 최신 데이터가 있다면 GUI 업데이트 및 CSV 저장
+                    if co2_value is not None:
+                        # 메인 스레드로 최신 데이터 전송
+                        self.data_signal.emit(self.sensor_index, co2_value)
 
-                        if current_date != today_str:
-                            current_date = today_str
-                            file_path = os.path.join(BASE_DIR, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
-                            if not os.path.exists(file_path):
+                        # 💡 [문제 해결 3] 과도한 파일 쓰기 방지 (1초에 최대 1번만 기록)
+                        current_time = time.time()
+                        if current_time - last_save_time >= 1.0:
+                            last_save_time = current_time
+                            
+                            now = datetime.now()
+                            today_str = now.strftime("%Y-%m-%d")
+                            time_str = now.strftime("%H:%M:%S")
+
+                            # 날짜가 바뀌면 새 파일 생성 및 헤더 쓰기
+                            if current_date != today_str:
+                                current_date = today_str
+                                file_path = os.path.join(BASE_DIR, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
+                                if not os.path.exists(file_path):
+                                    with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                        writer = csv.writer(f)
+                                        writer.writerow(["측정일자", "측정시간", f"포트({self.port_name}) CO2 (ppm)"])
+
+                            # 데이터 한 줄 추가
+                            try:
                                 with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
                                     writer = csv.writer(f)
-                                    writer.writerow(["측정일자", "측정시간", f"포트({self.port_name}) CO2 (ppm)"])
+                                    writer.writerow([today_str, time_str, co2_value])
+                            except PermissionError:
+                                pass # 파일이 엑셀 등으로 열려있을 때 무시
 
-                        try:
-                            with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
-                                writer = csv.writer(f)
-                                writer.writerow([today_str, time_str, co2])
-                        except PermissionError:
-                            pass
-                QThread.msleep(100) 
+                    # CPU 점유율을 낮추기 위한 휴식
+                    QThread.msleep(100)
 
-        except serial.SerialException:
-            # 포트가 없거나 다른 프로그램이 사용 중일 때 에러 시그널 발생
-            self.error_signal.emit(self.sensor_index, "연결 실패")
-        except Exception as e:
-            self.error_signal.emit(self.sensor_index, "오류 발생")
-        finally:
-            if 'ser' in locals() and ser.is_open:
-                ser.close()
-
+            except serial.SerialException:
+                # 💡 [문제 해결 1] USB가 뽑히거나 통신 에러 발생 시 프로그램이 뻗지 않음
+                self.error_signal.emit(self.sensor_index, "연결 끊김 (재연결 중)")
+                
+                # 열려있는 포트가 있다면 닫고 정리
+                if 'ser' in locals() and ser.is_open:
+                    ser.close()
+                
+                # 3초 대기 후 맨 위쪽의 while문으로 돌아가 자동으로 다시 연결 시도
+                QThread.msleep(3000)
+                
+            except Exception as e:
+                self.error_signal.emit(self.sensor_index, "알 수 없는 오류")
+                QThread.msleep(3000)
+                
+        # 스레드가 완전히 종료될 때 포트 닫기
+        if 'ser' in locals() and ser.is_open:
+            ser.close()
 # ==========================================
 #  [CO2 레벨 표시 위젯], 위젯
 # ==========================================
