@@ -16,7 +16,7 @@ BAUD_RATE = 9600
 
 # 여기에 장치 관리자에서 확인한 COM 포트 번호 3개를 적어주세요!
 # (만약 2개만 쓴다면 ["COM3", "COM4"] 까지만 적으셔도 됩니다.)
-TARGET_PORTS = ["COM3", "COM4", "COM9"] 
+TARGET_PORTS = ["COM9", "COM13",] 
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
@@ -166,12 +166,12 @@ class SerialThread(QThread):
 # ==========================================
 class CO2LevelWidget(QWidget):
     LEVELS = [
-        {"name": "좋음", "min": 400, "max": 600, "color": "#28A745"},        
-        {"name": "보통", "min": 601, "max": 800, "color": "#FFD700"},        
-        {"name": "민감군", "min": 801, "max": 1000, "color": "#FD7E14"},     
-        {"name": "나쁨", "min": 1001, "max": 1500, "color": "#DC3545"},      
-        {"name": "매우 나쁨", "min": 1501, "max": 2000, "color": "#800080"}, 
-        {"name": "위험", "min": 2001, "max": 5000, "color": "#795548"},      
+        {"name": "좋음", "min": 1, "max": 500, "color": "#28A745"},        
+        {"name": "보통", "min": 501, "max": 1000, "color": "#FFD700"},        
+        {"name": "민감군", "min": 1001, "max": 3000, "color": "#FD7E14"},     
+        {"name": "나쁨", "min": 3001, "max": 5000, "color": "#DC3545"},      
+        {"name": "매우 나쁨", "min": 5001, "max": 10000, "color": "#800080"}, 
+        {"name": "위험", "min": 10001, "max": 30000, "color": "#795548"},      
     ]
 
     def __init__(self, title="센서", parent=None):
