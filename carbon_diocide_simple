@@ -11,7 +11,7 @@ from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont, QColor
 
 # ==========================================
-# ⚙️ [사용자 설정 영역]
+#  [사용자 설정 영역]
 # ==========================================
 BAUD_RATE = 9600
 
@@ -64,8 +64,8 @@ def auto_detect_port():
         
     #  찾아낸 VID와 PID 값을 여기에 입력하세요!
     # (예시: CH340 칩셋인 경우 보통 VID 0x1A86, PID 0x7523 입니다)
-    TARGET_VID = 0x1A86
-    TARGET_PID = 0x7523
+    TARGET_VID = 0x0148
+    TARGET_PID = 0x4000
     
     for port in ports:
         # 현재 연결된 포트의 하드웨어 ID가 설정한 값과 정확히 일치하는지 확인
@@ -78,88 +78,136 @@ def auto_detect_port():
     return None
 
 # ==========================================
-#  [백그라운드 시리얼 통신 스레드]
+# 🧵 [백그라운드 시리얼 통신 스레드 - 에러 로그 기록 기능 추가]
 # ==========================================
 class SerialThread(QThread):
     data_signal = pyqtSignal(int)
+    error_signal = pyqtSignal(str)
+
+    def safe_sleep(self, ms):
+        for _ in range(ms // 100):
+            if self.isInterruptionRequested():
+                return  
+            QThread.msleep(100)
+
+    # 💡 [추가] 로그 파일에 타임스탬프와 메시지를 지정된 포맷으로 기록하는 함수
+    def write_log(self, message):
+        log_dir = os.path.join(BASE_DIR, "Logs")
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+            
+        log_file = os.path.join(log_dir, "error_log.txt")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        try:
+            with open(log_file, "a", encoding="utf-8") as f:
+                # 요청하신 형식: 첫 줄에 시간, 다음 줄에 메시지
+                f.write(f"{timestamp}\n{message}\n")
+        except Exception:
+            pass
 
     def run(self):
         current_date = ""
         file_path = ""
         last_save_time = 0
+        
+        # 💡 [추가] 중복 로그 방지를 위한 상태 변수
+        is_connected = False
+        last_port = "Unknown"
 
-        # 💡 [핵심 수정] 스레드가 강제 종료되지 않는 한 무한히 반복하여 재연결을 시도합니다.
         while not self.isInterruptionRequested():
             
-            # 1. 매 루프마다 포트를 새로 찾습니다.
             port_name = auto_detect_port()
             
-            # 포트를 못 찾았다면 2초 대기 후 처음으로 돌아가 다시 찾습니다.
+            # 포트를 못 찾았을 때
             if port_name is None:
-                QThread.msleep(2000)
+                if is_connected:
+                    # 연결되어 있다가 끊어진 직후 한 번만 로그 기록
+                    self.write_log(f"Serial {last_port} disconnected")
+                    self.write_log("Reconnecting...")
+                    is_connected = False
+                    
+                self.error_signal.emit("센서 탐색 중...")
+                self.safe_sleep(2000)  
                 continue
 
             try:
-                # 2. 포트를 찾았다면 연결을 시도합니다.
                 ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
+                last_port = port_name
                 
-                # 3. 연결이 유지되는 동안 데이터 읽기 반복
+                # 💡 [기능] 포트를 찾고 성공적으로 연결되었을 때 로그 기록
+                if not is_connected:
+                    self.write_log(f"Serial {port_name} connected")
+                    is_connected = True
+                
+                self.error_signal.emit("센서 초기화 중...")
+                init_start_time = time.time()
+                last_data_time = time.time()
+                
                 while ser.is_open and not self.isInterruptionRequested():
                     co2_value = None
+                    current_time = time.time()
                     
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
                         parsed = parse_custom_data(raw_data)
                         if parsed is not None:
                             co2_value = parsed
+                            last_data_time = current_time 
 
-                    if co2_value is not None:
-                        self.data_signal.emit(co2_value)
+                    if current_time - last_data_time >= 30.0:
+                        self.error_signal.emit("센서 데이터 없음 (확인 요망)")
                         
-                        current_time = time.time()
-                        if current_time - last_save_time >= 1.0:
-                            last_save_time = current_time
+                    elif co2_value is not None:
+                        if current_time - init_start_time < 3.0:
+                            pass 
+                        else:
+                            self.data_signal.emit(co2_value)
                             
-                            now = datetime.now()
-                            today_str = now.strftime("%Y-%m-%d")
-                            time_str = now.strftime("%H:%M:%S")
-# 날짜가 바뀌면 새 파일 생성 및 헤더 쓰기
-                        if current_date != today_str:
-                            current_date = today_str
-                            
-                            # 💡 [추가된 부분] 'CSV_Logs'라는 저장 폴더 경로 설정 및 자동 생성
-                            save_dir = os.path.join(BASE_DIR, "CSV_Logs")
-                            if not os.path.exists(save_dir):
-                                os.makedirs(save_dir) # 폴더가 없으면 생성
+                            if current_time - last_save_time >= 1.0:
+                                last_save_time = current_time
                                 
-                            # 💡 [수정된 부분] BASE_DIR 대신 새로 만든 save_dir 안에 파일 생성
-                            file_path = os.path.join(save_dir, f"CO2_log_{current_date}.csv")
-                            
-                            if not os.path.exists(file_path):
-                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
-                                    writer = csv.writer(f)
-                                    writer.writerow(["측정일자", "측정시간", "CO2 (ppm)"])
+                                now = datetime.now()
+                                today_str = now.strftime("%Y-%m-%d")
+                                time_str = now.strftime("%H:%M:%S")
 
-                            try:
-                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
-                                    writer = csv.writer(f)
-                                    writer.writerow([today_str, time_str, co2_value])
-                            except PermissionError:
-                                pass
+                                if current_date != today_str:
+                                    current_date = today_str
+                                    
+                                    save_dir = os.path.join(BASE_DIR, "CSV_Logs")
+                                    if not os.path.exists(save_dir):
+                                        os.makedirs(save_dir)
+                                        
+                                    file_path = os.path.join(save_dir, f"CO2_log_{current_date}.csv")
+                                    
+                                    if not os.path.exists(file_path):
+                                        with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                            writer = csv.writer(f)
+                                            writer.writerow(["측정일자", "측정시간", "CO2 (ppm)"])
+
+                                try:
+                                    with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                        writer = csv.writer(f)
+                                        writer.writerow([today_str, time_str, co2_value])
+                                except PermissionError:
+                                    pass
                     
-                    QThread.msleep(100) 
+                    self.safe_sleep(100) 
 
             except serial.SerialException:
-                # 💡 [핵심 수정] 사용 중 USB가 뽑히거나 통신이 끊어지면 여기로 빠져나옵니다.
-                # pass 처리 후 finally에서 포트를 닫고, 바깥쪽 while문으로 돌아가 다시 검색을 시작합니다.
+                # 💡 [기능] 작동 중 USB가 뽑히거나 통신 에러가 발생할 때 로그 기록
+                if is_connected:
+                    self.write_log(f"Serial {last_port} disconnected")
+                    self.write_log("Reconnecting...")
+                    is_connected = False
+                    
+                self.error_signal.emit("연결 끊김 (재연결 중)")
                 pass
             finally:
                 if 'ser' in locals() and ser is not None and ser.is_open:
                     ser.close()
             
-            # 통신 에러로 연결이 끊긴 경우 2초 대기 후 재연결 시도
-            QThread.msleep(2000)
-
+            self.safe_sleep(2000)
 # ==========================================
 #  [CO2 레벨 표시 위젯]
 # ==========================================
@@ -317,6 +365,18 @@ class CO2LevelWidget(QWidget):
         super().resizeEvent(event)
         self.update_arrow_position()
 
+    def set_error_state(self, msg):
+        """ 포트 연결 실패 및 끊김 시 호출되는 함수"""
+        self.co2_value_label.setText("----")
+        self.status_text_label.setText(msg)
+        
+        # 붉은색 경고 스타일로 변경
+        self.status_text_label.setStyleSheet("background-color: #FFCDD2; border-radius: 8px; color: #B71C1C;")
+        
+        # 화살표를 맨 왼쪽(0점)으로 초기화
+        self.current_value = self.LEVELS[0]['min']
+        self.update_arrow_position()
+
 
 # ==========================================
 #  [메인 GUI 클래스]
@@ -342,15 +402,21 @@ class CO2MonitorApp(QMainWindow):
     def start_thread(self):
         self.serial_thread = SerialThread()
         self.serial_thread.data_signal.connect(self.update_data)
+        #  [추가] 에러 신호를 handle_error 함수와 연결
+        self.serial_thread.error_signal.connect(self.handle_error) 
         self.serial_thread.start()
 
     def update_data(self, co2):
         self.co2_widget.update_co2(co2)
 
+    #  [추가] 에러 신호를 받아서 위젯에 전달하는 함수
+    def handle_error(self, error_msg):
+        self.co2_widget.set_error_state(error_msg)
+
     def closeEvent(self, event):
         if hasattr(self, 'serial_thread'):
             self.serial_thread.requestInterruption()
-            self.serial_thread.wait()
+            self.serial_thread.wait(1000)
         event.accept()
 
     # ==========================================

@@ -1,0 +1,29 @@
+import serial.tools.list_ports
+
+def print_port_info():
+    print("🔌 시스템에 연결된 COM 포트를 스캔합니다...\n")
+    
+    active_ports = serial.tools.list_ports.comports()
+    
+    if not active_ports:
+        print("❌ 연결된 COM 포트가 없습니다. 센서가 잘 꽂혀있는지 확인해 주세요.")
+        return
+
+    print("=" * 60)
+    for port in active_ports:
+        print(f"▶ 포트 이름 (Port) : {port.device}")
+        print(f"▶ 장치 설명 (Desc) : {port.description}")
+        print(f"▶ 전체 HWID        : {port.hwid}")
+        
+        # VID(Vendor ID)와 PID(Product ID)가 존재하는 경우 16진수(0x0000) 형태로 출력
+        if port.vid is not None and port.pid is not None:
+            vid_hex = f"0x{port.vid:04X}"
+            pid_hex = f"0x{port.pid:04X}"
+            print(f"⭐ VID / PID       : {vid_hex} / {pid_hex}")
+        else:
+            print("⭐ VID / PID       : 정보 없음 (가상 통신 포트일 확률이 높습니다)")
+            
+        print("-" * 60)
+
+if __name__ == "__main__":
+    print_port_info()
