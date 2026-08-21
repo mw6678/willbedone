@@ -5,6 +5,7 @@ import os
 import serial
 import time
 import re
+import traceback
 import serial.tools.list_ports
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
@@ -16,8 +17,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # [사용자 설정 영역]
 # ==========================================
 BAUD_RATE = 9600
-
-TARGET_SERIALS = ["123456", "5&31036E8E&0&1", "6&20617A81&0&3"]
+TARGET_SERIALS = ["123456", "6&20617A81&0&3", ]
 
 # ==========================================
 #  [수신 데이터 파싱 - 센서별 보정값 적용 및 예외 처리]
@@ -27,6 +27,7 @@ def parse_custom_data(raw_data, sensor_index):
         raw_data = raw_data.strip()
         raw_co2 = None
 
+        # 1. 숫자만 쏙 뽑아내기
         if "CO2" in raw_data.upper():
             match = re.search(r'CO2\s*[:=]?\s*([-+]?\d*\.?\d+)', raw_data, re.IGNORECASE)
             if match:
@@ -41,19 +42,30 @@ def parse_custom_data(raw_data, sensor_index):
 
         co2_value = None
 
+        # ====================================================
+        # 💡 2. 데이터 값 변경/보정 영역 (여기를 수정하세요!)
+        # 센서 인덱스 (0 = 첫 번째 센서, 1 = 두 번째 센서, 2 = 세 번째 센서)
+        # ====================================================
         if sensor_index == 0:
+            # 첫 번째 센서: 들어온 값 그대로 사용
             co2_value = int(raw_co2 * 1.0)
+            
         elif sensor_index == 1:
+            # 두 번째 센서: 
             co2_value = int(raw_co2 * 1.0)
+            
         elif sensor_index == 2:
+            # 세 번째 센서: 
             co2_value = int(raw_co2 * 1.0)
+            
         else:
             co2_value = int(raw_co2 * 1.0)
 
-        if co2_value is not None:
-            if co2_value < 0 or co2_value > 30000:
-                return None  
-            return co2_value
+        # 3. 안전 검사
+        if co2_value < 0 or co2_value > 30000:
+            return "OUT_OF_RANGE" # (개선된 위험 감지 적용 시)
+            
+        return co2_value
 
     except Exception as e:
         print(f"데이터 파싱 오류 (센서 인덱스 {sensor_index}): {e}")
@@ -86,15 +98,14 @@ class SerialThread(QThread):
         return None
 
     def safe_sleep(self, ms): 
-        for _ in range(ms // 1000):
+        for _ in range(ms // 100):
             if self.isInterruptionRequested():
                 return  
-            QThread.msleep(1000)
+            QThread.msleep(100)
 
     def write_log(self, message):
         log_dir = os.path.join(BASE_DIR, "Logs")
         os.makedirs(log_dir, exist_ok=True)
-            
         log_file = os.path.join(log_dir, f"error_log_Sensor{self.sensor_index + 1}.txt")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
@@ -111,15 +122,12 @@ class SerialThread(QThread):
 
         for dir_name in directories:
             target_dir = os.path.join(BASE_DIR, dir_name)
-            # 오타 수정됨 (os.parh -> os.path)
             if not os.path.exists(target_dir):
                 continue
-
             for filename in os.listdir(target_dir):
                 file_path = os.path.join(target_dir, filename)
                 if os.path.isfile(file_path):
                     try:
-                        # getatime을 getmtime(마지막 수정 시간)으로 변경
                         if os.path.getmtime(file_path) < threshold_time:
                             os.remove(file_path)
                     except Exception:
@@ -127,8 +135,8 @@ class SerialThread(QThread):
 
     def run(self):
         current_date = ""
-        file_path = ""
-        last_save_time = 0  
+        last_ui_update_time = 0  
+        last_save_time = 0
         is_connected = False 
         is_no_data_error_sent = False 
 
@@ -140,7 +148,7 @@ class SerialThread(QThread):
                 self.safe_sleep(3000)
                 continue 
             try:
-                ser = serial.Serial(self.current_port, BAUD_RATE, timeout=1)
+                ser = serial.Serial(self.current_port, BAUD_RATE, timeout=0.1)
                 
                 if not is_connected: 
                     self.write_log(f"통신 연결 성공 ({self.current_port})")
@@ -154,12 +162,23 @@ class SerialThread(QThread):
                     raw_co2_value = None
                     current_time = time.time()
 
+                    # 💡 [개선 2] 버퍼에 쌓인 데이터를 실시간으로 모두 읽어들임
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
+                        if not raw_data: continue
+                        
                         parsed = parse_custom_data(raw_data, self.sensor_index)
+                        
+                        # 💡 [개선 1] 이상치 플래그 감지 시 즉각 경보 및 로그 기록
+                        if parsed == "OUT_OF_RANGE":
+                            self.error_signal.emit(self.sensor_index, "범위 초과 (위험)")
+                            self.write_log(f"위험 경고: 측정값이 유효 범위를 벗어났습니다. Raw: {raw_data}")
+                            last_data_time = current_time
+                            continue
+
                         if parsed is not None:
                             raw_co2_value = parsed
-                            last_data_time = time.time()
+                            last_data_time = current_time
 
                     if current_time - last_data_time >= 30.0:
                         if not is_no_data_error_sent:
@@ -167,20 +186,21 @@ class SerialThread(QThread):
                             is_no_data_error_sent = True
                             self.data_buffer.clear()
 
-                    elif raw_co2_value is not None and raw_co2_value != 0:
+                    elif raw_co2_value is not None and isinstance(raw_co2_value, int):
                         is_no_data_error_sent = False
-                        if current_time - init_start_time >= 3.0:
-                            self.data_buffer.append(raw_co2_value)
-                            
-                            if len(self.data_buffer) > self.smoothing_window:
-                                self.data_buffer.pop(0)
-                                
+                        self.data_buffer.append(raw_co2_value)
+                        
+                        if len(self.data_buffer) > self.smoothing_window:
+                            self.data_buffer.pop(0)
+
+                        # 💡 [개선 2] 데이터 갱신 타이머 분리 (1초마다 UI 업데이트 및 저장)
+                        if current_time - last_ui_update_time >= 1.0:
+                            last_ui_update_time = current_time
                             smoothed_co2 = int(sum(self.data_buffer) / len(self.data_buffer))
                             self.data_signal.emit(self.sensor_index, smoothed_co2) 
 
                             if current_time - last_save_time >= 1.0:
                                 last_save_time = current_time
-                                
                                 now = datetime.now()
                                 today_str = now.strftime("%Y-%m-%d")
                                 time_str = now.strftime("%H:%M:%S")
@@ -190,13 +210,9 @@ class SerialThread(QThread):
 
                                 if current_date != today_str:
                                     current_date = today_str
-                                    
-                                    # 💡 청소 함수 호출 추가 (날짜 바뀔 때마다 실행)
                                     self.cleanup_old_logs()
-                                    
                                     file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
                                     if not os.path.exists(file_path):
-                                        # 💡 헤더 작성 시 발생할 수 있는 PermissionError 방어 추가
                                         try:
                                             with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
                                                 writer = csv.writer(f)
@@ -205,10 +221,7 @@ class SerialThread(QThread):
                                             pass
 
                                 self.csv_buffer.append([today_str, time_str, smoothed_co2])
-                                
-                                # 💡 메모리 누수 방지 (최대 10,000개 제한)
-                                if len(self.csv_buffer) > 10000:
-                                    self.csv_buffer.pop(0)
+                                if len(self.csv_buffer) > 10000: self.csv_buffer.pop(0)
 
                                 try:
                                     with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
@@ -218,20 +231,23 @@ class SerialThread(QThread):
                                 except PermissionError:
                                     pass
 
-                    self.safe_sleep(3000)
+                    # 💡 [개선 2] 3초 대기 -> 0.1초 대기로 변경하여 데이터 유실 및 병목 해결
+                    self.safe_sleep(100)
 
-            except serial.SerialException as e:
+            # 💡 [개선 3] 예외 처리 세분화 및 트레이스백 로그 기록
+            except serial.SerialException as se:
                 if is_connected: 
-                    self.write_log("통신 연결 끊김 (USB 분리 또는 오류)")
+                    self.write_log(f"시리얼 통신 오류 발생: {se}")
                     is_connected = False
                 self.data_buffer.clear()
                 self.error_signal.emit(self.sensor_index, "연결 끊김 (재연결 중)")
             except Exception as e:
                 if is_connected:
-                    self.write_log(f"알 수 없는 오류 발생: {str(e)}")
+                    err_trace = traceback.format_exc()
+                    self.write_log(f"시스템 치명적 오류 발생:\n{err_trace}")
                     is_connected = False
                 self.data_buffer.clear()
-                self.error_signal.emit(self.sensor_index, "시스템 오류 (재연결 중)")
+                self.error_signal.emit(self.sensor_index, "시스템 오류")
                 
             finally:
                 if 'ser' in locals() and ser is not None: 
@@ -241,7 +257,7 @@ class SerialThread(QThread):
                         pass
                     finally:
                         del ser 
-                self.safe_sleep(5000)
+                self.safe_sleep(3000)
 
 # ==========================================
 #  [CO2 레벨 표시 위젯]
