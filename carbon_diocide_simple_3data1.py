@@ -7,6 +7,8 @@ import time
 import re
 import traceback
 import serial.tools.list_ports
+import random  # 💡 난수 생성을 위해 추가
+
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont
@@ -17,12 +19,17 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # [사용자 설정 영역]
 # ==========================================
 BAUD_RATE = 9600
-TARGET_SERIALS = ["123456", "6&31DC396&0&3", "5&18923BAB&0&9"]
+TARGET_SERIALS = ["123456", "6&31DC396&0&3", "5&18923BAB&0&9" ]
+
+# 💡 1번 센서의 값을 공유하기 위한 전역 변수 추가
+GLOBAL_BASE_CO2 = 400.0  
 
 # ==========================================
 #  [수신 데이터 파싱 - 센서별 보정값 적용 및 예외 처리]
 # ==========================================
 def parse_custom_data(raw_data, sensor_index):
+    global GLOBAL_BASE_CO2  # 💡 전역 변수 사용 선언
+    
     try:
         raw_data = raw_data.strip()
         raw_co2 = None
@@ -43,27 +50,25 @@ def parse_custom_data(raw_data, sensor_index):
         co2_value = None
 
         # ====================================================
-        # 💡 2. 데이터 값 변경/보정 영역 (여기를 수정하세요!)
-        # 센서 인덱스 (0 = 첫 번째 센서, 1 = 두 번째 센서, 2 = 세 번째 센서)
+        # 💡 2. 데이터 값 조작 영역 (시연용 가우시안 노이즈)
         # ====================================================
         if sensor_index == 0:
-            # 첫 번째 센서: 들어온 값 그대로 사용
-            co2_value = int(raw_co2 * 1.0)
+            # 첫 번째 센서(기준): 들어온 진짜 값을 쓰고, 전역 변수에 저장
+            co2_value = int(raw_co2)
+            GLOBAL_BASE_CO2 = float(raw_co2)
             
-        elif sensor_index == 1:
-            # 두 번째 센서: 
-            co2_value = int(raw_co2 * 1.0)
-            
-        elif sensor_index == 2:
-            # 세 번째 센서: 
-            co2_value = int(raw_co2 * 1.0)
+        elif sensor_index == 1 or sensor_index == 2:
+            # 두 번째, 세 번째 센서: 1번 센서 값을 기준으로 3% 표준편차 가우시안 적용
+            std_dev = GLOBAL_BASE_CO2 * 0.03
+            manipulated_value = random.gauss(GLOBAL_BASE_CO2, std_dev)
+            co2_value = int(manipulated_value)
             
         else:
-            co2_value = int(raw_co2 * 1.0)
+            co2_value = int(raw_co2)
 
-        # 3. 안전 검사
+        # 3. 안전 검사 (조작된 값이 0 이하로 떨어지는 것 방지)
         if co2_value < 0 or co2_value > 30000:
-            return "OUT_OF_RANGE" # (개선된 위험 감지 적용 시)
+            return "OUT_OF_RANGE"
             
         return co2_value
 
@@ -85,10 +90,10 @@ class SerialThread(QThread):
         self.target_serial = target_serial
         self.sensor_index = sensor_index
         self.current_port = "대기중"
-        self.smoothing_window = 1 #smoothing_average
+        self.smoothing_window = 1 # 💡 스무딩 윈도우 1로 변경 (즉각 반응)
         self.data_buffer = []
         self.csv_buffer = []
-        self.minute_data_buffer = [] 
+        self.minute_data_buffer = [] # 💡 1분 평균 계산용 버퍼
         
     def find_com_port(self):
         ports = serial.tools.list_ports.comports()
