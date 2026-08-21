@@ -17,7 +17,7 @@ from PyQt5.QtGui import QFont
 # ==========================================
 BAUD_RATE = 9600
 
-TARGET_SERIALS = ["123456", "5&18923BAB&0&9", "6&F9BED0F&0&3"]
+TARGET_SERIALS = ["123456", "5&31036E8E&0&1", "6&20617A81&0&3"]
 # ==========================================
 #  [수신 데이터 파싱 - 센서별 보정값 적용 및 예외 처리]
 # ==========================================
@@ -101,10 +101,9 @@ class SerialThread(QThread):
                 return  
             QThread.msleep(1000)
 
-    def write_log(self, message): 
+    def write_log(self, message):
         log_dir = os.path.join(BASE_DIR, "Logs")
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
+        os.makedirs(log_dir, exist_ok=True)
             
         log_file = os.path.join(log_dir, f"error_log_Sensor{self.sensor_index + 1}.txt")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -160,7 +159,8 @@ class SerialThread(QThread):
                             self.data_buffer.clear()
 
                     elif raw_co2_value is not None and raw_co2_value !=0:
-                        if current_time - init_start_time >= 3.0: 
+                        is_no_data_error_sent = False  # 데이터 정상 수신 시 "데이터 없음" 경보 잠금 해제
+                        if current_time - init_start_time >= 3.0:
                             self.data_buffer.append(raw_co2_value)
                             
                             if len(self.data_buffer) > self.smoothing_window:
@@ -176,21 +176,18 @@ class SerialThread(QThread):
                                 today_str = now.strftime("%Y-%m-%d")
                                 time_str = now.strftime("%H:%M:%S")
 
-                                save_dir = os.path.join(BASE_DIR, "CSV_Logs") 
-                                if not os.path.exists(save_dir):
-                                    os.makedirs(save_dir)
+                                save_dir = os.path.join(BASE_DIR, "CSV_Logs")
+                                os.makedirs(save_dir, exist_ok=True)
 
                                 if current_date != today_str:
                                     current_date = today_str
-                                    file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv") 
+                                    file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
                                     if not os.path.exists(file_path):
                                         with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
                                             writer = csv.writer(f)
-
-                                            if os.path.getsize(file_path) == 0:
-                                                # 수정됨: self.port_name -> self.current_port
-                                                writer.writerow(["측정일자", "측정시간", f"포트({self.current_port}) Co2 (ppm)"])
-                                            writer.writerow([today_str, time_str, smoothed_co2])
+                                            # 수정됨: self.port_name -> self.current_port
+                                            writer.writerow(["측정일자", "측정시간", f"포트({self.current_port}) Co2 (ppm)"])
+                                        # 참고: 데이터 행은 아래 공통 try 블록에서 한 번만 기록합니다 (중복 기록 방지)
 
                                 try:
                                     with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
