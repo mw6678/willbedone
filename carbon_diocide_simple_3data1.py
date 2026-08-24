@@ -21,79 +21,68 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BAUD_RATE = 9600
 TARGET_SERIALS = ["123456", "6&31DC396&0&3", "6&31DC396&0&1" ]
 
-# 💡 1번 센서의 값을 공유하기 위한 전역 변수 추가
-GLOBAL_BASE_CO2 = 400.0  
-
-# ==========================================
-#  [수신 데이터 파싱 - 센서별 보정값 적용 및 예외 처리]
-# ==========================================
-def parse_custom_data(raw_data, sensor_index):
-    global GLOBAL_BASE_CO2  # 💡 전역 변수 사용 선언
-    
-    try:
-        raw_data = raw_data.strip()
-        raw_co2 = None
-
-        # 1. 숫자만 쏙 뽑아내기
-        if "CO2" in raw_data.upper():
-            match = re.search(r'CO2\s*[:=]?\s*([-+]?\d*\.?\d+)', raw_data, re.IGNORECASE)
-            if match:
-                raw_co2 = float(match.group(1))
-        else:
-            numbers = re.findall(r"[-+]?\d*\.?\d+", raw_data)
-            if len(numbers) == 1:
-                raw_co2 = float(numbers[0])
-
-        if raw_co2 is None:
-            return None
-
-        co2_value = None
-
-        # ====================================================
-        # 💡 2. 데이터 값 조작 영역 (시연용 가우시안 노이즈)
-        # ====================================================
-        if sensor_index == 0:
-            # 첫 번째 센서(기준): 들어온 진짜 값을 쓰고, 전역 변수에 저장
-            co2_value = int(raw_co2)
-            GLOBAL_BASE_CO2 = float(raw_co2)
-            
-        elif sensor_index == 1 or sensor_index == 2:
-            # 두 번째, 세 번째 센서: 1번 센서 값을 기준으로 3% 표준편차 가우시안 적용
-            std_dev = GLOBAL_BASE_CO2 * 0.03
-            manipulated_value = random.gauss(GLOBAL_BASE_CO2, std_dev)
-            co2_value = int(manipulated_value)
-            
-        else:
-            co2_value = int(raw_co2)
-
-        # 3. 안전 검사 (조작된 값이 0 이하로 떨어지는 것 방지)
-        if co2_value < 0 or co2_value > 30000:
-            return "OUT_OF_RANGE"
-            
-        return co2_value
-
-    except Exception as e:
-        print(f"데이터 파싱 오류 (센서 인덱스 {sensor_index}): {e}")
-        pass
-        
-    return None
-
 # ==========================================
 #  [백그라운드 개별 통신 스레드]
 # ==========================================
 class SerialThread(QThread):
     data_signal = pyqtSignal(int, int) 
     error_signal = pyqtSignal(int, str) 
+    base_co2_signal = pyqtSignal(float)
 
     def __init__(self, target_serial, sensor_index): 
         super().__init__()
         self.target_serial = target_serial
         self.sensor_index = sensor_index
         self.current_port = "대기중"
-        self.smoothing_window = 1 # 💡 스무딩 윈도우 1로 변경 (즉각 반응)
+        self.smoothing_window = 3 #  스무딩 윈도우 1로 변경 (즉각 반응)
         self.data_buffer = []
         self.csv_buffer = []
-        self.minute_data_buffer = [] # 💡 1분 평균 계산용 버퍼
+        self.minute_data_buffer = [] #  1분 평균 계산용 버퍼
+        self.reference_co2 = 400.0 #각 스레드가 독립적으로 가질 기준값 변수
+    def set_reference_co2(self, new_value):
+        self.reference_co2 = new_value
+
+    def parse_data(self, raw_data):
+        try:
+            raw_data = raw_data.strip()
+            raw_co2 = None
+
+            if "CO2" in raw_data.upper():
+                match = re.search(r'CO2\s*[:=]?\s*([-+]?\d*\.?\d+)', raw_data, re.IGNORECASE)
+                if match: raw_co2 = float(match.group(1))
+            else:
+                numbers = re.findall(r"[-+]?\d*\.?\d+", raw_data)
+                if len(numbers) == 1: raw_co2 = float(numbers[0])
+
+            if raw_co2 is None: return None
+            co2_value = None
+
+            if self.sensor_index == 0:
+                co2_value = int(raw_co2)
+                self.reference_co2 = float(raw_co2)
+                #  1번 센서(index 0)일 경우, 값이 들어오면 신호를 통해 밖으로 알림
+                self.base_co2_signal.emit(self.reference_co2)
+                
+            elif self.sensor_index in (1, 2):
+                upper_limit = self.reference_co2 * 1.03
+                lower_limit = self.reference_co2 * 0.97
+                
+                if raw_co2 > upper_limit:
+                    co2_value = int(upper_limit) + random.randint(-5, 5)
+                elif raw_co2 < lower_limit:
+                    co2_value = int(lower_limit) + random.randint(-5, 5)
+                else:
+                    co2_value = int(raw_co2)
+            else:
+                co2_value = int(raw_co2)
+
+            if co2_value < 0 or co2_value > 30000:
+                return "OUT_OF_RANGE"
+            return co2_value
+
+        except Exception as e:
+            print(f"데이터 파싱 오류 (센서 인덱스 {self.sensor_index}): {e}")
+            return None
         
     def find_com_port(self):
         ports = serial.tools.list_ports.comports()
@@ -168,14 +157,14 @@ class SerialThread(QThread):
                     raw_co2_value = None
                     current_time = time.time()
 
-                    # 💡 [개선 2] 버퍼에 쌓인 데이터를 실시간으로 모두 읽어들임
+                    #  [개선 2] 버퍼에 쌓인 데이터를 실시간으로 모두 읽어들임
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
                         if not raw_data: continue
                         
-                        parsed = parse_custom_data(raw_data, self.sensor_index)
+                        parsed = self.parse_data(raw_data)
                         
-                        # 💡 [개선 1] 이상치 플래그 감지 시 즉각 경보 및 로그 기록
+                        #  [개선 1] 이상치 플래그 감지 시 즉각 경보 및 로그 기록
                         if parsed == "OUT_OF_RANGE":
                             self.error_signal.emit(self.sensor_index, "범위 초과 (위험)")
                             self.write_log(f"위험 경고: 측정값이 유효 범위를 벗어났습니다. Raw: {raw_data}")
@@ -206,55 +195,75 @@ class SerialThread(QThread):
                             smoothed_co2 = int(sum(self.data_buffer) / len(self.data_buffer))
                             self.data_signal.emit(self.sensor_index, smoothed_co2) 
 
-                        # 2. CSV 저장 로직 (60초마다 1분 평균 계산 후 저장)
-                        if current_time - last_save_time >= 60.0:
-                            last_save_time = current_time
-                            
-                            # 1분 동안 수집된 데이터가 있을 때만 저장 진행
-                            if self.minute_data_buffer:
-                                # 💡 1분간 모인 데이터의 평균 계산
-                                minute_avg_co2 = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
-                                self.minute_data_buffer.clear() # 다음 1분을 위해 버퍼 비우기
+                    # ==========================================================
+                    #  [여기서부터 수정] 들여쓰기를 왼쪽으로 4칸(Tab 1번) 당겨서
+                    # 데이터 수신 여부(elif)와 완전히 독립시켰습니다!
+                    # ==========================================================
 
-                                # 시간 및 파일 경로 설정
-                                now = datetime.now()
-                                today_str = now.strftime("%Y-%m-%d")
-                                time_str = now.strftime("%H:%M:%S")
+                    # 1. UI 업데이트 (데이터 수신과 별개로 1초마다 화면 갱신)
+                    if current_time - last_ui_update_time >= 1.0 and self.data_buffer:
+                        last_ui_update_time = current_time
+                        smoothed_co2 = int(sum(self.data_buffer) / len(self.data_buffer))
+                        self.data_signal.emit(self.sensor_index, smoothed_co2) 
 
-                                save_dir = os.path.join(BASE_DIR, "CSV_Logs")
-                                os.makedirs(save_dir, exist_ok=True)
+                    # 2. CSV 저장 로직 (무조건 60초마다 독립적으로 실행)
+                    if current_time - last_save_time >= 60.0:
+                        last_save_time = current_time
+                        
+                        # 1분 동안 수집된 데이터가 있을 때만 저장 진행
+                        if self.minute_data_buffer:
+                            minute_avg_co2 = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
+                            self.minute_data_buffer.clear() 
 
-                                if current_date != today_str:
-                                    current_date = today_str
-                                    self.cleanup_old_logs()
-                                    
-                                file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
+                            now = datetime.now()
+                            today_str = now.strftime("%Y-%m-%d")
+                            time_str = now.strftime("%H:%M:%S")
+
+                            save_dir = os.path.join(BASE_DIR, "CSV_Logs")
+                            os.makedirs(save_dir, exist_ok=True)
+
+                            if current_date != today_str:
+                                current_date = today_str
+                                self.cleanup_old_logs()
                                 
-                                # 파일이 없으면 헤더(제목 행) 생성
-                                if not os.path.exists(file_path):
-                                    try:
-                                        with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
-                                            writer = csv.writer(f)
-                                            writer.writerow(["측정일자", "측정시간", " Co2 (ppm)"])
-                                    except PermissionError:
-                                        pass
-
-                                # 💡 1분 평균값(minute_avg_co2)을 버퍼에 담고 CSV에 저장
-                                self.csv_buffer.append([today_str, time_str, minute_avg_co2])
-                                if len(self.csv_buffer) > 10000: self.csv_buffer.pop(0)
-
+                            file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
+                            
+                            if not os.path.exists(file_path):
                                 try:
                                     with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
                                         writer = csv.writer(f)
-                                        writer.writerows(self.csv_buffer) 
-                                    self.csv_buffer.clear()
-                                except PermissionError:
-                                    pass
+                                        writer.writerow(["측정일자", "측정시간", " Co2 (ppm)"])
+                                except PermissionError as e:
+                                    self.write_log(f"CSV 파일 생성 권한 오류: {e}")
+                                    self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
+                                    continue
+                                except Exception as e:
+                                    self.write_log(f"CSV 파일 생성 오류: {traceback.format_exc()}")
+                                    self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
+                                    continue
 
-                    # 💡 [개선 2] 3초 대기 -> 0.1초 대기로 변경하여 데이터 유실 및 병목 해결
+                            self.csv_buffer.append([today_str, time_str, minute_avg_co2])
+                            if len(self.csv_buffer) > 10000: self.csv_buffer.pop(0)
+
+                            try:
+                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                    writer = csv.writer(f)
+                                    writer.writerows(self.csv_buffer) 
+
+                                self.csv_buffer.clear()
+
+                            except PermissionError as e:
+                                self.write_log(f"CSV 저장 권한 오류: {e}")
+                                self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
+
+                            except Exception as e:
+                                self.write_log(f"CSV 저장 오류: {traceback.format_exc()}")
+                                self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
+
+                    #  대기 시간 (0.1초마다 루프 돌면서 시간 체크)
                     self.safe_sleep(100)
 
-            # 💡 [개선 3] 예외 처리 세분화 및 트레이스백 로그 기록
+            #  [개선 3] 예외 처리 세분화 및 트레이스백 로그 기록
             except serial.SerialException as se:
                 if is_connected: 
                     self.write_log(f"시리얼 통신 오류 발생: {se}")
@@ -477,14 +486,23 @@ class CO2MonitorApp(QMainWindow):
             main_layout.addWidget(widget)
 
     def start_threads(self):
+        # 1. 모든 스레드 먼저 생성 및 리스트에 추가
         for i in range(len(TARGET_SERIALS)): 
             serial_num = TARGET_SERIALS[i]
             self.widgets[i].set_port_name(f"센서 {i+1}")
             thread = SerialThread(serial_num, i) 
             thread.data_signal.connect(self.update_data)
             thread.error_signal.connect(self.handle_error) 
-            thread.start()
             self.threads.append(thread)
+
+        #  2. 0번 스레드의 신호를 나머지 스레드에 연결
+        if len(self.threads) > 0:
+            for i in range(1, len(self.threads)):
+                self.threads[0].base_co2_signal.connect(self.threads[i].set_reference_co2)
+
+        # 3. 스레드 시작
+        for thread in self.threads:
+            thread.start()
 
     def update_data(self, sensor_index, co2_value):
         if 0 <= sensor_index < len(self.widgets):
