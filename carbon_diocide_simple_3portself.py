@@ -110,12 +110,13 @@ class SerialThread(QThread):
         self.sensor_index = sensor_index
         self.smoothing_window = 2 
         self.data_buffer = []
-        self.csv_buffer = []
         self.minute_data_buffer = [] 
-        self.reference_co2 = 400.0 
+        self.reference_co2 = 400.0
+        self.is_reference_ready = True if self.sensor_index == 0 else False 
 
     def set_reference_co2(self, new_value):
         self.reference_co2 = new_value
+        self.is_reference_ready = True
 
     def parse_data(self, raw_data):
         try:
@@ -157,12 +158,18 @@ class SerialThread(QThread):
         except Exception as e:
             return None
 
-    def safe_sleep(self, ms): 
-        for _ in range(ms // 100):
-            if self.isInterruptionRequested():
-                return  
-            QThread.msleep(100)
+    def safe_sleep(self, ms):
+        end_time = time.time() + (ms / 1000.0)
 
+        while time.time() < end_time:
+            if self.isInterruptionRequested():
+                return
+
+            remaining = end_time - time.time()
+            QThread.msleep(
+                min(100, max(1, int(remaining * 1000)))
+            )
+            
     def write_log(self, message):
         log_dir = os.path.join(BASE_DIR, "Logs")
         os.makedirs(log_dir, exist_ok=True)
@@ -196,9 +203,10 @@ class SerialThread(QThread):
     def run(self):
         current_date = ""
         last_ui_update_time = 0  
-        last_save_time = 0
         is_connected = False 
         is_no_data_error_sent = False 
+
+        current_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M") 
 
         while not self.isInterruptionRequested():
             try:
@@ -217,10 +225,15 @@ class SerialThread(QThread):
                     raw_co2_value = None
                     current_time = time.time()
 
+                    # 1. 시리얼 데이터 수신 및 파싱
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
                         if not raw_data: continue
-                        
+
+                        if not self.is_reference_ready:
+                            last_data_time = current_time # 연결 끊김 에러 방지용
+                            continue # 아래 파싱 로직을 타지 않고 바로 다음 데이터로 넘어감
+
                         parsed = self.parse_data(raw_data)
                         
                         if parsed == "OUT_OF_RANGE":
@@ -233,12 +246,14 @@ class SerialThread(QThread):
                             raw_co2_value = parsed
                             last_data_time = current_time
 
+                    # 2. 통신 끊김 (30초) 확인
                     if current_time - last_data_time >= 30.0:
                         if not is_no_data_error_sent:
                             self.error_signal.emit(self.sensor_index, "데이터 없음")
                             is_no_data_error_sent = True
                             self.data_buffer.clear()
 
+                    # 3. 데이터 버퍼 추가 및 1초 단위 화면(UI) 갱신
                     elif raw_co2_value is not None and isinstance(raw_co2_value, int):
                         is_no_data_error_sent = False
                         self.data_buffer.append(raw_co2_value)
@@ -252,49 +267,69 @@ class SerialThread(QThread):
                             smoothed_co2 = int(sum(self.data_buffer) / len(self.data_buffer))
                             self.data_signal.emit(self.sensor_index, smoothed_co2) 
 
-                    # CSV 저장 로직
-                    if current_time - last_ui_update_time >= 1.0 and self.data_buffer:
-                        last_save_time = current_time
-                        
-                        if self.minute_data_buffer:
-                            minute_avg_co2 = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
+                    # ==========================================
+                    # 4. 정확한 1분 단위 CSV 저장
+                    # ==========================================
 
-                            now = datetime.now()
-                            today_str = now.strftime("%Y-%m-%d")
-                            time_str = now.strftime("%H:%M:%S")
+                    now = datetime.now()
+                    new_minute_key = now.strftime("%Y-%m-%d %H:%M")
+
+                    # 현재 분이 이전 분과 달라졌으면
+                    # 이전 분의 데이터를 CSV로 저장
+                    if new_minute_key != current_minute_key:
+
+                        # 이전 분의 데이터가 있는 경우에만 저장
+                        if self.minute_data_buffer:
+                    
+                            # 이전 1분 동안 수집된 데이터 평균
+                            minute_avg_co2 = int(
+                                sum(self.minute_data_buffer) / len(self.minute_data_buffer))
+
+                            # 저장할 분 = 새로 바뀐 현재 분이 아니라
+                            # 방금 끝난 '이전 분'
+                            previous_minute = datetime.strptime(current_minute_key, "%Y-%m-%d %H:%M")
+
+                            save_date = previous_minute.strftime("%Y-%m-%d")
+                            save_time = previous_minute.strftime("%H:%M")
 
                             save_dir = os.path.join(BASE_DIR, "CSV_Logs")
                             os.makedirs(save_dir, exist_ok=True)
 
-                            if current_date != today_str:
-                                current_date = today_str
+                            # 날짜가 변경되었으면 오래된 로그 정리
+                            if current_date != save_date:
+                                current_date = save_date
                                 self.cleanup_old_logs()
-                                
-                            file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
-                            
-                            if not os.path.exists(file_path):
-                                try:
-                                    with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
-                                        writer = csv.writer(f)
-                                        writer.writerow(["측정일자", "측정시간", " Co2 (ppm)"])
-                                except Exception as e:
-                                    self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
-                                    continue
 
-                            self.csv_buffer.append([today_str, time_str, minute_avg_co2])
-                            if len(self.csv_buffer) > 10000: self.csv_buffer.pop(0)
+                            file_path = os.path.join(
+                                save_dir,
+                                f"CO2_log_{save_date}_Sensor{self.sensor_index + 1}.csv"
+)
 
                             try:
-                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                # CSV 파일이 없으면 헤더 생성
+                                if not os.path.exists(file_path):
+                                    with open(file_path, mode="w", newline="", encoding="utf-8-sig") as f:               
+                                        writer = csv.writer(f)
+                                        writer.writerow =(["측정일자", "측정시간", " Co2 (ppm)"])
+                    
+                                # 1분 평균값 1줄 저장
+                                with open( file_path, mode="a", newline="", encoding="utf-8-sig") as f:
+                    
                                     writer = csv.writer(f)
-                                    writer.writerows(self.csv_buffer) 
 
-                                self.csv_buffer.clear()
+                                    writer.writerow([save_date, save_time, minute_avg_co2])
+
+                                # CSV 저장이 성공한 경우에만 버퍼 삭제
                                 self.minute_data_buffer.clear()
 
                             except Exception as e:
+
                                 self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
 
+                                self.write_log(f"CSV 저장 오류: {e}")
+
+                        # 새로운 분으로 변경
+                        current_minute_key = new_minute_key
                     self.safe_sleep(100)
 
             except serial.SerialException as se:
