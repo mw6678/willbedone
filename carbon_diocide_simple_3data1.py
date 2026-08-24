@@ -19,7 +19,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # [사용자 설정 영역]
 # ==========================================
 BAUD_RATE = 9600
-TARGET_SERIALS = ["123456", "6&31DC396&0&3", "5&18923BAB&0&9" ]
+TARGET_SERIALS = ["123456", "6&31DC396&0&3", "6&31DC396&0&1" ]
 
 # 💡 1번 센서의 값을 공유하기 위한 전역 변수 추가
 GLOBAL_BASE_CO2 = 400.0  
