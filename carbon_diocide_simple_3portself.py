@@ -310,7 +310,7 @@ class SerialThread(QThread):
                                 if not os.path.exists(file_path):
                                     with open(file_path, mode="w", newline="", encoding="utf-8-sig") as f:               
                                         writer = csv.writer(f)
-                                        writer.writerow =(["측정일자", "측정시간", " Co2 (ppm)"])
+                                        writer.writerow (["측정일자", "측정시간", " Co2 (ppm)"])
                     
                                 # 1분 평균값 1줄 저장
                                 with open( file_path, mode="a", newline="", encoding="utf-8-sig") as f:
