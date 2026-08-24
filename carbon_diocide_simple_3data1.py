@@ -7,7 +7,7 @@ import time
 import re
 import traceback
 import serial.tools.list_ports
-import random  # 💡 난수 생성을 위해 추가
+import random  #  난수 생성을 위해 추가
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
@@ -202,18 +202,13 @@ class SerialThread(QThread):
 
                     # 1. UI 업데이트 (데이터 수신과 별개로 1초마다 화면 갱신)
                     if current_time - last_ui_update_time >= 1.0 and self.data_buffer:
-                        last_ui_update_time = current_time
-                        smoothed_co2 = int(sum(self.data_buffer) / len(self.data_buffer))
-                        self.data_signal.emit(self.sensor_index, smoothed_co2) 
 
                     # 2. CSV 저장 로직 (무조건 60초마다 독립적으로 실행)
-                    if current_time - last_save_time >= 60.0:
                         last_save_time = current_time
                         
                         # 1분 동안 수집된 데이터가 있을 때만 저장 진행
                         if self.minute_data_buffer:
                             minute_avg_co2 = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
-                            self.minute_data_buffer.clear() 
 
                             now = datetime.now()
                             today_str = now.strftime("%Y-%m-%d")
@@ -251,6 +246,7 @@ class SerialThread(QThread):
                                     writer.writerows(self.csv_buffer) 
 
                                 self.csv_buffer.clear()
+                                self.minute_data_buffer.clear()
 
                             except PermissionError as e:
                                 self.write_log(f"CSV 저장 권한 오류: {e}")
