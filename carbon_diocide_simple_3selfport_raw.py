@@ -245,18 +245,18 @@ class SerialThread(QThread):
                     now = datetime.now()
                     current_minute_key = now.strftime("%Y-%m-%d %H:%M")
                     if current_minute_key != last_saved_minute_key:
-                        
-                        # 1분 동안 수집된 데이터가 있을 때만 저장 진행
                         if self.minute_data_buffer:
                             minute_avg_co2 = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
 
-                            today_str = now.strftime("%Y-%m-%d")
-                            time_str = now.strftime("%H:%M:%S") 
+                            # 데이터가 실제로 수집된 '직전 분'을 기준으로 라벨링
+                            prev_minute_dt = datetime.strptime(last_saved_minute_key, "%Y-%m-%d %H:%M")
+                            today_str = prev_minute_dt.strftime("%Y-%m-%d")
+                            time_str = prev_minute_dt.strftime("%H:%M:00")
 
                             save_dir = os.path.join(BASE_DIR, "CSV_Logs")
                             os.makedirs(save_dir, exist_ok=True)
-                            last_saved_minute_key = current_minute_key  
-                            
+                            last_saved_minute_key = current_minute_key
+
                             if current_date != today_str:
                                 current_date = today_str
                                 self.cleanup_old_logs()
