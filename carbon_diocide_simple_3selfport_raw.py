@@ -7,8 +7,6 @@ import time
 import re
 import traceback
 import serial.tools.list_ports
-import random
-
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QComboBox, QPushButton, QDialog, QMessageBox)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont
@@ -19,62 +17,85 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # [사용자 설정 영역]
 # ==========================================
 BAUD_RATE = 9600
+# 센서별 CO2 보정값(ppm)
+# 센서 1 = 0번, 센서 2 = 1번, 센서 3 = 2번
+SENSOR_OFFSETS = {0: 0.0, 1: +105.0, 2: +80.0 }
+
+# 센서 허용 측정 범위
+CO2_MIN = 0
+CO2_MAX = 30000
+
+# 화면 표시용 이동평균 개수
+SMOOTHING_WINDOW = 5
 
 # ==========================================
 #  [포트 선택 초기 화면 위젯]
 # ==========================================
 class PortSelectionDialog(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("센서 포트 설정")
-        self.setFixedSize(350, 250)
-        self.setStyleSheet("background-color: white;")
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.selected_ports = []
-        
+        self.comboboxes = []  # [수정] 콤보박스 리스트 초기화
+
+        self.setWindowTitle("CO2 센서 포트 설정")
         self.initUI()
+        self.refresh_ports()  # 초기 포트 로드
 
     def initUI(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(15)
+        layout.setSpacing(12)
 
+        top_layout = QHBoxLayout()
         title = QLabel("CO2 센서 COM 포트 선택")
         title.setFont(QFont("Malgun Gothic", 12, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
+        
+        self.refresh_btn = QPushButton("🔄 새로고침")
+        self.refresh_btn.setFont(QFont("Malgun Gothic", 9))
+        self.refresh_btn.setStyleSheet("padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px;")
+        self.refresh_btn.clicked.connect(self.refresh_ports)
 
-        # 현재 연결된 포트 목록 가져오기
-        available_ports = [p.device for p in serial.tools.list_ports.comports()]
-        if not available_ports:
-            available_ports = ["연결된 포트 없음"]
+        top_layout.addWidget(title)
+        top_layout.addStretch(1)
+        top_layout.addWidget(self.refresh_btn)
+        layout.addLayout(top_layout)
 
-        self.comboboxes = []
-        for i in range(3):  # 3개의 센서용 콤보박스 생성
+        for i in range(3):
             row_layout = QHBoxLayout()
             label = QLabel(f"센서 {i+1} 포트:")
             label.setFont(QFont("Malgun Gothic", 10))
             
             combo = QComboBox()
-            combo.addItems(available_ports)
             combo.setStyleSheet("padding: 5px; border: 1px solid gray; border-radius: 3px;")
             
-            # 센서가 여러 개일 때 콤보박스 기본값을 다르게 설정 (포트 개수만큼)
-            if len(available_ports) > i and available_ports[0] != "연결된 포트 없음":
-                combo.setCurrentIndex(i)
-                
             self.comboboxes.append(combo)
-            
             row_layout.addWidget(label)
             row_layout.addWidget(combo)
             layout.addLayout(row_layout)
 
-        # 시작 버튼
         self.start_btn = QPushButton("모니터링 시작")
         self.start_btn.setFixedHeight(40)
         self.start_btn.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
         self.start_btn.setStyleSheet("background-color: #007BFF; color: white; border-radius: 5px;")
         self.start_btn.clicked.connect(self.on_start_clicked)
         layout.addWidget(self.start_btn)
+
+    # [신규 추가] 연결된 포트 새로고침 기능
+    def refresh_ports(self):
+        available_ports = [p.device for p in serial.tools.list_ports.comports()]
+        if not available_ports:
+            available_ports = ["연결된 포트 없음"]
+
+        for i, combo in enumerate(self.comboboxes):
+            current_text = combo.currentText()
+            combo.clear()
+            combo.addItems(available_ports)
+            
+            # 기존 선택 포트 유지, 없으면 0, 1, 2 순으로 기본 선택
+            if current_text in available_ports:
+                combo.setCurrentText(current_text)
+            elif len(available_ports) > i and available_ports[0] != "연결된 포트 없음":
+                combo.setCurrentIndex(i)
 
     def on_start_clicked(self):
         ports = [combo.currentText() for combo in self.comboboxes]
@@ -113,30 +134,38 @@ class SerialThread(QThread):
         self.csv_buffer = []
         self.minute_data_buffer = [] 
 
-    def set_reference_co2(self, new_value):
-        self.reference_co2 = new_value
-        self.is_reference_ready = True
-
     def parse_data(self, raw_data):
         try:
             raw_data = raw_data.strip()
+    
+            if not raw_data:
+                return None
+
             raw_co2 = None
 
             if "CO2" in raw_data.upper():
-                match = re.search(r'CO2\s*[:=]?\s*([-+]?\d*\.?\d+)', raw_data, re.IGNORECASE)
-                if match: raw_co2 = float(match.group(1))
+                match = re.search(
+                    r'CO2\s*[:=]?\s*([-+]?\d*\.?\d+)', raw_data, re.IGNORECASE)
+
+                if match:
+                    raw_co2 = float(match.group(1))
+
             else:
                 numbers = re.findall(r"[-+]?\d*\.?\d+", raw_data)
-                if len(numbers) == 1: raw_co2 = float(numbers[0])
 
-            if raw_co2 is None: return None
-            co2_value = int(raw_co2)
+                if len(numbers) == 1:
+                    raw_co2 = float(numbers[0])
 
-            if co2_value < 0 or co2_value > 30000:
+            if raw_co2 is None:
+                return None
+
+            # 원본값의 범위 검사
+            if raw_co2 < CO2_MIN or raw_co2 > CO2_MAX:
                 return "OUT_OF_RANGE"
-            return co2_value
 
-        except Exception as e:
+            return raw_co2
+
+        except Exception:
             return None
 
     def safe_sleep(self, ms): 
@@ -181,27 +210,27 @@ class SerialThread(QThread):
         is_connected = False 
         is_no_data_error_sent = False 
 
-        # 시작할 때의 '분(minute)' 기억
+        # [수정 1] SENSOR_OFFSETS 보정값 가져오기
         last_saved_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         while not self.isInterruptionRequested():
+            ser = None
             try:
-                # 직접 지정된 포트로 시리얼 연결 시도
                 ser = serial.Serial(self.current_port, BAUD_RATE, timeout=0.1)
                 
                 if not is_connected: 
                     self.write_log(f"통신 연결 성공 ({self.current_port})")
                     is_connected = True
                     self.data_buffer.clear()
+                    # [수정 2] 연결 성공 직후 기존 버퍼의 찌꺼기 데이터 삭제
+                    ser.reset_input_buffer()
 
-                init_start_time = time.time()
                 last_data_time = time.time()
 
                 while ser.is_open and not self.isInterruptionRequested():
                     raw_co2_value = None
                     current_time = time.time()
 
-                    # 1. 시리얼 데이터 수신 및 파싱
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
                         if not raw_data: continue
@@ -215,7 +244,19 @@ class SerialThread(QThread):
                             continue
 
                         if parsed is not None:
-                            raw_co2_value = parsed
+                            # 1. UI 화면에 보여줄 원본 데이터
+                            raw_co2_value = parsed 
+                            
+                            # 2. 보정값 가져오기
+                            current_offset = SENSOR_OFFSETS.get(self.sensor_index, 0.0)
+                            
+                            #  [조건 추가] 파싱된 값이 보정값(절대값 또는 양수 기준 등) 이하일 때의 처리
+                            # 예: 파싱값이 해당 센서의 보정값보다 작거나 같으면 보정을 안 하고 원본 그대로 쓰거나 0으로 처리
+                            if parsed <= current_offset:
+                                calibrated_co2_value = parsed  # 보정값을 더하지 않고 원본 유지 (혹은 0)
+                            else:
+                                calibrated_co2_value = parsed + current_offset
+                            
                             last_data_time = current_time
 
                     # 2. 통신 끊김 (30초) 확인
@@ -225,11 +266,11 @@ class SerialThread(QThread):
                             is_no_data_error_sent = True
                             self.data_buffer.clear()
 
-                    # 3. 데이터 버퍼 추가 및 1초 단위 화면(UI) 갱신
-                    elif raw_co2_value is not None and isinstance(raw_co2_value, int):
+                    # 3. 데이터 버퍼 추가 (float, int 모두 허용) [수정]
+                    elif 'calibrated_co2_value' in locals() and isinstance(calibrated_co2_value, (int, float)):
                         is_no_data_error_sent = False
-                        self.data_buffer.append(raw_co2_value)
-                        self.minute_data_buffer.append(raw_co2_value) 
+                        self.data_buffer.append(calibrated_co2_value)
+                        self.minute_data_buffer.append(calibrated_co2_value)
                         
                         if len(self.data_buffer) > self.smoothing_window:
                             self.data_buffer.pop(0)
@@ -237,25 +278,20 @@ class SerialThread(QThread):
                         if current_time - last_ui_update_time >= 1.0:
                             last_ui_update_time = current_time
                             smoothed_co2 = int(sum(self.data_buffer) / len(self.data_buffer))
-                            self.data_signal.emit(self.sensor_index, smoothed_co2) 
+                            self.data_signal.emit(self.sensor_index, smoothed_co2)
 
-                    # ==========================================
-                    # 4. 실제 시계의 '분'이 바뀔 때 저장 (Time Drift 완벽 해결)
-                    # ==========================================
+                    # 4. 1분 단위 CSV 저장 로직
                     now = datetime.now()
                     current_minute_key = now.strftime("%Y-%m-%d %H:%M")
                     if current_minute_key != last_saved_minute_key:
                         if self.minute_data_buffer:
                             minute_avg_co2 = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
-
-                            # 데이터가 실제로 수집된 '직전 분'을 기준으로 라벨링
                             prev_minute_dt = datetime.strptime(last_saved_minute_key, "%Y-%m-%d %H:%M")
                             today_str = prev_minute_dt.strftime("%Y-%m-%d")
                             time_str = prev_minute_dt.strftime("%H:%M:00")
 
                             save_dir = os.path.join(BASE_DIR, "CSV_Logs")
                             os.makedirs(save_dir, exist_ok=True)
-                            last_saved_minute_key = current_minute_key
 
                             if current_date != today_str:
                                 current_date = today_str
@@ -263,30 +299,20 @@ class SerialThread(QThread):
                                 
                             file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
                             
-                            if not os.path.exists(file_path):
-                                try:
-                                    with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
-                                        writer = csv.writer(f)
-                                        writer.writerow(["측정일자", "측정시간", " Co2 (ppm)"])
-                                except Exception as e:
-                                    self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
-                                    continue
-
-                            self.csv_buffer.append([today_str, time_str, minute_avg_co2])
-                            if len(self.csv_buffer) > 10000: self.csv_buffer.pop(0)
-
+                            file_exists = os.path.exists(file_path)
                             try:
                                 with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
                                     writer = csv.writer(f)
-                                    writer.writerows(self.csv_buffer) 
-
-                                self.csv_buffer.clear()
-                                self.minute_data_buffer.clear() # 1분마다 버퍼 비워주기
+                                    if not file_exists:
+                                        writer.writerow(["측정일자", "측정시간", "센서번호", "포트", "Co2 1분 평균(ppm)"])
+                                    writer.writerow([today_str, time_str, self.sensor_index + 1, self.current_port, minute_avg_co2])
+                                
+                                self.minute_data_buffer.clear()
+                                last_saved_minute_key = current_minute_key  # [수정] 성공 시 갱신
 
                             except Exception as e:
                                 self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
 
-                    # 과부하 방지용 짧은 대기
                     self.safe_sleep(100)
 
             except serial.SerialException as se:
@@ -304,18 +330,17 @@ class SerialThread(QThread):
                 self.error_signal.emit(self.sensor_index, "시스템 오류")
                 
             finally:
-                if 'ser' in locals() and ser is not None: 
+                if ser is not None and ser.is_open: 
                     try:
                         ser.close() 
                     except Exception:
                         pass
-                # 에러 발생 시 재시도 대기 시간
                 self.safe_sleep(3000)
 
 # ==========================================
 #  [CO2 레벨 표시 위젯] (기존 동일)
 # ==========================================
-class CO2LevelWidget(QWidget):
+class CO2LevelWidget(QWidget): #사랑넷 원하는 기준표
     LEVELS = [
         {"name": "좋음", "min": 1, "max": 500, "color": "#28A745"},        
         {"name": "보통", "min": 501, "max": 1000, "color": "#FFD700"},        
@@ -325,8 +350,9 @@ class CO2LevelWidget(QWidget):
         {"name": "위험", "min": 10001, "max": 30000, "color": "#795548"},      
     ]
 
-    def __init__(self, title="센서", parent=None):
+    def __init__(self, sensor_index, title="센서", parent=None):
         super().__init__(parent)
+        self.sensor_index = sensor_index # 센서 번호 저장
         self.title = title
         self.current_value = 400 
         self.initUI()
@@ -373,7 +399,7 @@ class CO2LevelWidget(QWidget):
         self.arrow_label.setAlignment(Qt.AlignCenter)
         self.arrow_label.setFixedWidth(20)
         self.arrow_label.setParent(self.arrow_container)
-        
+        self.arrow_label.hide()
         main_layout.addWidget(self.arrow_container)
 
         level_bar_frame = QFrame()
@@ -407,13 +433,13 @@ class CO2LevelWidget(QWidget):
         self.status_text_label.setStyleSheet("background-color: #E0E0E0; border-radius: 8px; color: gray;")
         
         main_layout.addWidget(self.status_text_label)
+        # ----------------------------------------------------
         main_layout.addStretch(1)
 
-    def set_port_name(self, port_name):
-        self.title_label.setText(self.title)
-
     def update_co2(self, value):
-        self.arrow_label.show()
+        #  추가: 파싱된 데이터가 들어왔을 때 비로소 화살표와 보정창을 표시
+        self.arrow_label.show()         
+        
         self.current_value = value
         self.co2_value_label.setText(str(value))
 
@@ -493,7 +519,7 @@ class CO2MonitorApp(QMainWindow):
 
     def initUI(self):
         self.setWindowTitle("이산화탄소 다중 모니터링")
-        self.resize(780, 320) 
+        self.resize(780, 360) 
         self.setStyleSheet("QMainWindow { background-color: white; border: none; }") 
 
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -507,7 +533,7 @@ class CO2MonitorApp(QMainWindow):
         self.widgets = []
         for i, port in enumerate(self.target_ports):
             # 타이틀에 할당된 포트 번호도 작게 표시하여 헷갈리지 않게 함
-            widget = CO2LevelWidget(title=f"센서 {i+1} ({port})") 
+            widget = CO2LevelWidget(sensor_index=i, title=f"센서 {i+1} ({port})") 
             self.widgets.append(widget)
             main_layout.addWidget(widget)
 
@@ -537,12 +563,11 @@ class CO2MonitorApp(QMainWindow):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self.dragPos = event.globalPos()
+            self.dragPos = event.globalPos() - self.frameGeometry().topLeft()
 
     def mouseMoveEvent(self, event):
         if event.buttons() == Qt.LeftButton:
-            self.move(self.pos() + event.globalPos() - self.dragPos)
-            self.dragPos = event.globalPos()
+            self.move(event.globalPos() - self.dragPos)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
