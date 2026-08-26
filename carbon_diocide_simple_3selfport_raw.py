@@ -19,7 +19,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BAUD_RATE = 9600
 # 센서별 CO2 보정값(ppm)
 # 센서 1 = 0번, 센서 2 = 1번, 센서 3 = 2번
-SENSOR_OFFSETS = {0: 0.0, 1: +105.0, 2: +80.0 }
+SENSOR_OFFSETS = {0: 0.0, 1: +105.0, 2: +90.0 }
 
 # 센서 허용 측정 범위
 CO2_MIN = 0
