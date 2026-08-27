@@ -7,7 +7,10 @@ import time
 import re
 import traceback
 import serial.tools.list_ports
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFrame, QComboBox, QPushButton, QDialog, QMessageBox)
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, 
+    QHBoxLayout, QLabel, QFrame, QComboBox, 
+    QPushButton, QDialog, QMessageBox)
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont
 
@@ -19,14 +22,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 BAUD_RATE = 9600
 # 센서별 CO2 보정값(ppm)
 # 센서 1 = 0번, 센서 2 = 1번, 센서 3 = 2번
-SENSOR_OFFSETS = {0: 0.0, 1: +105.0, 2: +90.0 }
+SENSOR_OFFSETS = {0: 0.0, 1: +85.0, 2: +65.0 }
 
 # 센서 허용 측정 범위
 CO2_MIN = 0
 CO2_MAX = 30000
 
 # 화면 표시용 이동평균 개수
-SMOOTHING_WINDOW = 5
+SMOOTHING_WINDOW = 1
 
 # ==========================================
 #  [포트 선택 초기 화면 위젯]
@@ -127,44 +130,36 @@ class SerialThread(QThread):
 
     def __init__(self, port_name, sensor_index): 
         super().__init__()
-        self.current_port = port_name  # 직접 지정된 포트 이름 (예: 'COM23')
+        self.current_port = port_name  
         self.sensor_index = sensor_index
         self.smoothing_window = 2 
         self.data_buffer = []
-        self.csv_buffer = []
         self.minute_data_buffer = [] 
+        self.last_recorded_status = "정상"  # 1분 동안 발생한 에러 상태 추적용
 
     def parse_data(self, raw_data):
         try:
             raw_data = raw_data.strip()
-    
             if not raw_data:
                 return None
 
             raw_co2 = None
-
             if "CO2" in raw_data.upper():
-                match = re.search(
-                    r'CO2\s*[:=]?\s*([-+]?\d*\.?\d+)', raw_data, re.IGNORECASE)
-
+                match = re.search(r'CO2\s*[:=]?\s*([-+]?\d*\.?\d+)', raw_data, re.IGNORECASE)
                 if match:
                     raw_co2 = float(match.group(1))
-
             else:
                 numbers = re.findall(r"[-+]?\d*\.?\d+", raw_data)
-
                 if len(numbers) == 1:
                     raw_co2 = float(numbers[0])
 
             if raw_co2 is None:
                 return None
 
-            # 원본값의 범위 검사
             if raw_co2 < CO2_MIN or raw_co2 > CO2_MAX:
                 return "OUT_OF_RANGE"
 
             return raw_co2
-
         except Exception:
             return None
 
@@ -182,7 +177,8 @@ class SerialThread(QThread):
         
         try:
             with open(log_file, "a", encoding="utf-8") as f:
-                f.write(f"{timestamp} | 포트: {self.current_port} | {message}\n")
+                # 에러 이유가 명확히 남도록 메시지 포맷 강화
+                f.write(f"{timestamp} | 포트: {self.current_port} | 상태/사유: {message}\n")
         except Exception:
             pass
 
@@ -206,11 +202,10 @@ class SerialThread(QThread):
 
     def run(self):
         current_date = ""
-        last_ui_update_time = 0  
+        last_ui_update_time =  0  
         is_connected = False 
         is_no_data_error_sent = False 
 
-        # [수정 1] SENSOR_OFFSETS 보정값 가져오기
         last_saved_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         while not self.isInterruptionRequested():
@@ -219,16 +214,16 @@ class SerialThread(QThread):
                 ser = serial.Serial(self.current_port, BAUD_RATE, timeout=0.1)
                 
                 if not is_connected: 
-                    self.write_log(f"통신 연결 성공 ({self.current_port})")
+                    self.write_log(f"통신 연결 성공")
                     is_connected = True
                     self.data_buffer.clear()
-                    # [수정 2] 연결 성공 직후 기존 버퍼의 찌꺼기 데이터 삭제
+                    self.last_recorded_status = "정상"
                     ser.reset_input_buffer()
 
                 last_data_time = time.time()
 
                 while ser.is_open and not self.isInterruptionRequested():
-                    raw_co2_value = None
+                    calibrated_co2_value = None
                     current_time = time.time()
 
                     while ser.in_waiting > 0:
@@ -238,36 +233,35 @@ class SerialThread(QThread):
                         parsed = self.parse_data(raw_data)
                         
                         if parsed == "OUT_OF_RANGE":
-                            self.error_signal.emit(self.sensor_index, "범위 초과 (위험)")
-                            self.write_log(f"위험 경고: 측정값이 유효 범위를 벗어났습니다. Raw: {raw_data}")
+                            err_msg = "범위 초과 (위험)"
+                            self.error_signal.emit(self.sensor_index, err_msg)
+                            self.write_log(err_msg)
+                            self.last_recorded_status = err_msg
                             last_data_time = current_time
                             continue
 
                         if parsed is not None:
-                            # 1. UI 화면에 보여줄 원본 데이터
-                            raw_co2_value = parsed 
-                            
-                            # 2. 보정값 가져오기
                             current_offset = SENSOR_OFFSETS.get(self.sensor_index, 0.0)
-                            
-                            #  [조건 추가] 파싱된 값이 보정값(절대값 또는 양수 기준 등) 이하일 때의 처리
-                            # 예: 파싱값이 해당 센서의 보정값보다 작거나 같으면 보정을 안 하고 원본 그대로 쓰거나 0으로 처리
                             if parsed <= current_offset:
-                                calibrated_co2_value = parsed  # 보정값을 더하지 않고 원본 유지 (혹은 0)
+                                calibrated_co2_value = parsed  
                             else:
                                 calibrated_co2_value = parsed + current_offset
                             
                             last_data_time = current_time
+                            self.last_recorded_status = "정상"
 
-                    # 2. 통신 끊김 (30초) 확인
+                    # 1. 통신 끊김 (30초 이상 데이터 없음)
                     if current_time - last_data_time >= 30.0:
                         if not is_no_data_error_sent:
+                            err_msg = "데이터 없음 (30초 초과)"
                             self.error_signal.emit(self.sensor_index, "데이터 없음")
+                            self.write_log(err_msg)
+                            self.last_recorded_status = "데이터 없음"
                             is_no_data_error_sent = True
                             self.data_buffer.clear()
 
-                    # 3. 데이터 버퍼 추가 (float, int 모두 허용) [수정]
-                    elif 'calibrated_co2_value' in locals() and isinstance(calibrated_co2_value, (int, float)):
+                    # 2. 정상 데이터 버퍼 추가
+                    elif calibrated_co2_value is not None and isinstance(calibrated_co2_value, (int, float)):
                         is_no_data_error_sent = False
                         self.data_buffer.append(calibrated_co2_value)
                         self.minute_data_buffer.append(calibrated_co2_value)
@@ -280,54 +274,63 @@ class SerialThread(QThread):
                             smoothed_co2 = int(sum(self.data_buffer) / len(self.data_buffer))
                             self.data_signal.emit(self.sensor_index, smoothed_co2)
 
-                    # 4. 1분 단위 CSV 저장 로직
+                    # 3. 1분 단위 CSV 저장 로직 (데이터가 없거나 에러여도 1분마다 기록)
                     now = datetime.now()
                     current_minute_key = now.strftime("%Y-%m-%d %H:%M")
+                    
                     if current_minute_key != last_saved_minute_key:
-                        if self.minute_data_buffer:
-                            minute_avg_co2 = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
-                            prev_minute_dt = datetime.strptime(last_saved_minute_key, "%Y-%m-%d %H:%M")
-                            today_str = prev_minute_dt.strftime("%Y-%m-%d")
-                            time_str = prev_minute_dt.strftime("%H:%M:00")
+                        prev_minute_dt = datetime.strptime(last_saved_minute_key, "%Y-%m-%d %H:%M")
+                        today_str = prev_minute_dt.strftime("%Y-%m-%d")
+                        time_str = prev_minute_dt.strftime("%H:%M:00")
 
-                            save_dir = os.path.join(BASE_DIR, "CSV_Logs")
-                            os.makedirs(save_dir, exist_ok=True)
+                        save_dir = os.path.join(BASE_DIR, "CSV_Logs")
+                        os.makedirs(save_dir, exist_ok=True)
 
-                            if current_date != today_str:
-                                current_date = today_str
-                                self.cleanup_old_logs()
-                                
-                            file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
+                        if current_date != today_str:
+                            current_date = today_str
+                            self.cleanup_old_logs()
                             
-                            file_exists = os.path.exists(file_path)
-                            try:
-                                with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
-                                    writer = csv.writer(f)
-                                    if not file_exists:
-                                        writer.writerow(["측정일자", "측정시간", "센서번호", "포트", "Co2 1분 평균(ppm)"])
-                                    writer.writerow([today_str, time_str, self.sensor_index + 1, self.current_port, minute_avg_co2])
-                                
-                                self.minute_data_buffer.clear()
-                                last_saved_minute_key = current_minute_key  # [수정] 성공 시 갱신
+                        file_path = os.path.join(save_dir, f"CO2_log_{current_date}_Sensor{self.sensor_index + 1}.csv")
+                        file_exists = os.path.exists(file_path)
 
-                            except Exception as e:
-                                self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
+                        # 저장할 값 결정 (정상이면 1분 평균, 아니면 발생했던 에러 상태 문자열 기록)
+                        if self.minute_data_buffer:
+                            record_value = int(sum(self.minute_data_buffer) / len(self.minute_data_buffer))
+                            self.minute_data_buffer.clear()
+                        else:
+                            record_value = f"Error: {self.last_recorded_status}"
+
+                        try:
+                            with open(file_path, mode='a', newline='', encoding='utf-8-sig') as f:
+                                writer = csv.writer(f)
+                                if not file_exists:
+                                    writer.writerow(["측정일자", "측정시간", "센서번호", "포트", "Co2 1분 평균(ppm)"])
+                                writer.writerow([today_str, time_str, self.sensor_index + 1, self.current_port, record_value])
+                            
+                            last_saved_minute_key = current_minute_key  
+
+                        except Exception as e:
+                            self.write_log(f"CSV 저장 중 시스템 오류 발생: {str(e)}")
+                            self.error_signal.emit(self.sensor_index, "CSV 저장 오류")
 
                     self.safe_sleep(100)
 
             except serial.SerialException as se:
+                err_msg = f"시리얼 연결 실패/끊김: {se}"
                 if is_connected: 
-                    self.write_log(f"시리얼 통신 오류 발생: {se}")
+                    self.write_log(err_msg)
                     is_connected = False
                 self.data_buffer.clear()
                 self.error_signal.emit(self.sensor_index, "연결 실패/끊김")
+                self.last_recorded_status = "연결 끊김"
             except Exception as e:
+                err_msg = f"시스템 예외 오류: {traceback.format_exc()}"
                 if is_connected:
-                    err_trace = traceback.format_exc()
-                    self.write_log(f"시스템 오류: {err_trace}")
+                    self.write_log(err_msg)
                     is_connected = False
                 self.data_buffer.clear()
                 self.error_signal.emit(self.sensor_index, "시스템 오류")
+                self.last_recorded_status = "시스템 오류"
                 
             finally:
                 if ser is not None and ser.is_open: 
@@ -336,7 +339,7 @@ class SerialThread(QThread):
                     except Exception:
                         pass
                 self.safe_sleep(3000)
-
+                
 # ==========================================
 #  [CO2 레벨 표시 위젯] (기존 동일)
 # ==========================================
