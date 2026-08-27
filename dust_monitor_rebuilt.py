@@ -34,7 +34,7 @@ SENSOR_OFFSETS = {
 }
 
 # 화면 표시용 최근값 평균 개수
-SMOOTHING_WINDOW = 2
+SMOOTHING_WINDOW = 1
 
 # 데이터가 이 시간 동안 없으면 통신 오류로 판단
 NO_DATA_TIMEOUT = 30.0
@@ -355,7 +355,7 @@ class DustLevelWidget(QWidget):
 # 3. 센서별 백그라운드 시리얼 통신
 # ==========================================
 class SerialThread(QThread):
-    # port, pm1, pm25, pm10
+    # port, pm10, pm25, pm1
     data_signal = pyqtSignal(str, int, int, int)
     error_signal = pyqtSignal(str, str)
 
@@ -405,9 +405,9 @@ class SerialThread(QThread):
             if len(parts) < 3:
                 return None
 
-            pm10 = max(0, int(round(float(parts[0]) + self.offset)))
+            pm10 = max(0, int(round(float(parts[2]) + self.offset)))
             pm25 = max(0, int(round(float(parts[1]) + self.offset)))
-            pm1 = max(0, int(round(float(parts[2]) + self.offset)))
+            pm1 = max(0, int(round(float(parts[0]) + self.offset)))
 
             # 비정상적으로 큰 값은 무효 처리
             if pm1 > 1000 or pm25 > 1000 or pm10 > 2000:
@@ -607,7 +607,7 @@ class SerialThread(QThread):
                     elif raw_values is not None:
                         no_data_error_sent = False
 
-                        pm1, pm25, pm10 = raw_values
+                        pm10, pm25, pm1 = raw_values
 
                         # 화면용 최근값 버퍼
                         self.data_buffer["pm10"].append(pm10)
@@ -879,7 +879,7 @@ class DustMonitorApp(QMainWindow):
             # PM1.0  -> PM1.0_LEVELS
             w_pm10 = DustLevelWidget(
                 "PM10 (미세먼지)",
-                PM1_LEVELS
+                PM10_LEVELS
             )
 
             w_pm25 = DustLevelWidget(
@@ -889,7 +889,7 @@ class DustMonitorApp(QMainWindow):
 
             w_pm1 = DustLevelWidget(
                 "PM1.0 (극미세먼지)",
-                PM10_LEVELS
+                PM1_LEVELS
             )
 
             port_layout.addWidget(w_pm10)
