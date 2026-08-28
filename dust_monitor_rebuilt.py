@@ -93,6 +93,8 @@ class DustParser:
 # 3. 로깅 및 파일 처리 (Sensor Logger)
 # ==========================================
 class SensorLogger:
+    _cleanup_done = False  # 클래스 변수: 앱 전체에서 한 번만 정리
+
     def __init__(self, port_name, sensor_index):
         self.port_name = port_name
         self.sensor_index = sensor_index
@@ -100,9 +102,11 @@ class SensorLogger:
         self.csv_dir = os.path.join(BASE_DIR, "CSV_Logs")
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.csv_dir, exist_ok=True)
-        
-        # 프로그램 구동(또는 센서 연결) 시점에 한 번만 과거 로그를 정리하도록 이동합니다.
-        self.cleanup_old_logs()
+
+        if not SensorLogger._cleanup_done:
+            self.cleanup_old_logs()
+            SensorLogger._cleanup_done = True
+
 
     def write_error(self, message):
         log_file = os.path.join(self.log_dir, f"error_log_Sensor{self.sensor_index + 1}.txt")
@@ -174,7 +178,6 @@ class SerialThread(QThread):
         self.logger = SensorLogger(port_name, sensor_index)
         self.data_buffer = {"pm10": [], "pm25": [], "pm1": []}
         self.minute_data_buffer = {"pm10": [], "pm25": [], "pm1": []}
-        self.last_known_values = (0, 0, 0)
 
     def safe_sleep(self, ms):
         elapsed = 0
@@ -211,9 +214,8 @@ class SerialThread(QThread):
                 last_data_time = time.time()
 
                 while ser.is_open and not self.isInterruptionRequested():
-                    raw_values = None
-                    
-                    # 1. 데이터 수신 및 파싱
+                    # 1. 데이터 수신 및 파싱 (틱 동안 들어온 값을 전부 수집)
+                    parsed_values = []
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
                         if not raw_data: continue
@@ -224,8 +226,9 @@ class SerialThread(QThread):
                             self.logger.write_error(f"범위 초과 Raw: {raw_data}")
                             continue
                         elif parsed is not None:
-                            raw_values = parsed
+                            parsed_values.append(parsed)
                             last_data_time = time.time()
+
 
                     # 2. 타임아웃 체크
                     if time.time() - last_data_time >= Config.NO_DATA_TIMEOUT:
@@ -236,21 +239,21 @@ class SerialThread(QThread):
                             self.clear_buffers()
 
                     # 3. 정상 데이터 버퍼링 및 UI 업데이트
-                    elif raw_values is not None:
+                    elif parsed_values:
                         no_data_error_sent = False
-                        pm10, pm25, pm1 = raw_values
 
-                        for key, val in zip(["pm10", "pm25", "pm1"], raw_values):
-                            self.data_buffer[key].append(val)
-                            self.minute_data_buffer[key].append(val)
-                            if len(self.data_buffer[key]) > Config.SMOOTHING_WINDOW:
-                                self.data_buffer[key].pop(0)
+                        for pm10, pm25, pm1 in parsed_values:
+                            for key, val in zip(["pm10", "pm25", "pm1"], (pm10, pm25, pm1)):
+                                self.minute_data_buffer[key].append(val)  # CSV 평균용: 전부 누적
+                                self.data_buffer[key].append(val)          # 화면 표시용
+                                if len(self.data_buffer[key]) > Config.SMOOTHING_WINDOW:
+                                    self.data_buffer[key].pop(0)
 
                         if time.time() - last_ui_update_time >= 1.0:
                             last_ui_update_time = time.time()
                             avgs = [int(sum(self.data_buffer[k]) / len(self.data_buffer[k])) for k in ["pm10", "pm25", "pm1"]]
-                            self.last_known_values = tuple(avgs)
                             self.data_signal.emit(self.port_name, *avgs)
+
 
                     # 4. 분 단위 CSV 저장
                     current_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -425,16 +428,18 @@ class DustLevelWidget(QWidget):
         self.current_value = value
         self.val_label.setText(str(value))
 
-        current_level = self.levels[0] if value < self.levels[0]["min"] else self.levels[-1]
-        for level in self.levels:
-            if value <= level["max"]:
-                current_level = level
-                break
+        current_level = self.levels[self._find_level_index(value)]
 
         self.status_text_label.setText(current_level["name"])
         text_color = "black" if current_level["name"] == "보통" else "white"
         self.status_text_label.setStyleSheet(f"background-color: {current_level['color']}; border-radius: 6px; color: {text_color}; border: none;")
         self.update_arrow_position()
+
+    def _find_level_index(self, value):
+        for i, level in enumerate(self.levels):
+            if value <= level["max"]:
+                return i
+        return len(self.levels) - 1
 
     def set_error_state(self, msg):
         self.val_label.setText("----")
@@ -449,11 +454,7 @@ class DustLevelWidget(QWidget):
             return
 
         value = self.current_value
-        level_index = len(self.levels) - 1
-        for i, level in enumerate(self.levels):
-            if value <= level["max"]:
-                level_index = i
-                break
+        level_index = self._find_level_index(value)
 
         current_level = self.levels[level_index]
         level_min, level_max = current_level["min"], current_level["max"]
