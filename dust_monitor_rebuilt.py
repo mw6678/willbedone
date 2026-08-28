@@ -100,19 +100,22 @@ class SensorLogger:
         self.csv_dir = os.path.join(BASE_DIR, "CSV_Logs")
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.csv_dir, exist_ok=True)
+        
+        # 프로그램 구동(또는 센서 연결) 시점에 한 번만 과거 로그를 정리하도록 이동합니다.
+        self.cleanup_old_logs()
 
     def write_error(self, message):
         log_file = os.path.join(self.log_dir, f"error_log_Sensor{self.sensor_index + 1}.txt")
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
-            with open(log_file, "a", encoding="utf-8") as f:
+            with open(log_file, "a", encoding="utf-8-sig") as f:
                 f.write(f"{timestamp} | 포트: {self.port_name} | {message}\n")
         except Exception:
             pass
 
     def save_minute_data(self, minute_key, buffers):
         if not buffers["pm1"]:
-            return
+            return True  # 저장할 데이터가 없으면 성공(True)으로 간주
 
         try:
             avg_pm10 = round(sum(buffers["pm10"]) / len(buffers["pm10"]), 1)
@@ -131,10 +134,14 @@ class SensorLogger:
                 if not file_exists:
                     writer.writerow(["측정일자", "측정시간", "포트", "PM10_평균", "PM2.5_평균", "PM1.0_평균"])
                 writer.writerow([date_str, time_str, self.port_name, avg_pm10, avg_pm25, avg_pm1])
+            return True  # 저장 성공 시 True 반환
 
-            self.cleanup_old_logs()
+        except PermissionError:
+            self.write_error("CSV 접근 거부 (엑셀 등으로 파일이 열려있는지 확인하세요). 데이터를 보존합니다.")
+            return False  # 권한 에러 발생 시 버퍼를 유지하기 위해 False 반환
         except Exception as e:
             self.write_error(f"CSV 저장 오류: {e}")
+            return False
 
     def cleanup_old_logs(self):
         threshold_time = time.time() - (Config.LOG_RETENTION_DAYS * 24 * 60 * 60)
@@ -248,9 +255,13 @@ class SerialThread(QThread):
                     # 4. 분 단위 CSV 저장
                     current_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
                     if current_minute_key != last_saved_minute_key:
-                        self.logger.save_minute_data(last_saved_minute_key, self.minute_data_buffer)
-                        for key in self.minute_data_buffer:
-                            self.minute_data_buffer[key].clear()
+                        # 반환값이 True(성공)일 때만 버퍼를 비움
+                        is_saved = self.logger.save_minute_data(last_saved_minute_key, self.minute_data_buffer)
+                        if is_saved:
+                            for key in self.minute_data_buffer:
+                                self.minute_data_buffer[key].clear()
+                        
+                        # 키 업데이트는 저장 여부와 상관없이 진행하여 무한루프 방지
                         last_saved_minute_key = current_minute_key
 
                     self.safe_sleep(100)
@@ -345,7 +356,7 @@ class DustLevelWidget(QWidget):
         self.initUI()
 
     def initUI(self):
-        self.setStyleSheet("background-color: white; border-radius: 10px; border: 1px solid #E0E0E0;")
+        self.setStyleSheet("background-color: transparent; border: none;")        
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(3)
@@ -453,8 +464,13 @@ class DustLevelWidget(QWidget):
 
         target_bar = self.level_bars[level_index]
         target_x = target_bar.geometry().x() + (target_bar.geometry().width() * ratio)
-        
-        self.arrow_label.move(QPoint(int(target_x - (self.arrow_label.width() / 2)), int(self.arrow_container.height() - self.arrow_label.height() + 2)))
+        # 1. 화살표가 위치할 X 좌표 계산
+        arrow_x = int(target_x - (self.arrow_label.width() / 2))
+        # 2. 화살표가 잘리지 않도록 최소 0, 최대 (컨테이너 너비 - 화살표 너비) 사이로 제한
+        max_x = self.arrow_container.width() - self.arrow_label.width()
+        arrow_x = max(0, min(arrow_x, max_x))
+        # 3. 제한된 좌표를 적용하여 화살표 이동
+        self.arrow_label.move(QPoint(arrow_x, int(self.arrow_container.height() - self.arrow_label.height() + 2)))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -526,8 +542,15 @@ class DustMonitorApp(QMainWindow):
             widgets["pm1"].set_error_state(error_msg)
 
     def closeEvent(self, event):
-        for thread in self.threads: thread.requestInterruption()
-        for thread in self.threads: thread.wait(1500)
+        # 1. 모든 스레드에 정지 신호(Interruption)를 먼저 동시에 보냄
+        for thread in self.threads: 
+            thread.requestInterruption()
+            
+        # 2. 모든 스레드가 종료될 때까지 대기 (스레드가 내부에서 safe_sleep 중이므로 즉시 종료됨)
+        for thread in self.threads: 
+            # 1500ms(1.5초)가 아니라, 짧은 유예 시간만 주거나 인자 없이 기다림
+            thread.wait(500) 
+            
         event.accept()
 
     def mousePressEvent(self, event):
