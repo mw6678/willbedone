@@ -20,9 +20,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # [사용자 설정 영역]
 # ==========================================
 BAUD_RATE = 9600
-# 센서별 CO2 보정값(ppm)
+
+# 센서별 2점 보정 파라미터 {센서index: (기울기 Slope, 절편 Offset)} 기울기 1.1 = ex) 300 -> 330
 # 센서 1 = 0번, 센서 2 = 1번, 센서 3 = 2번
-SENSOR_OFFSETS = {0: 0.0, 1: +82.0, 2: +53.0 }
+SENSOR_CALIB_PARAMS = {
+    0: (1.0000, +0.0),  
+    1: (1.094081, +0.0),  
+    2: (1.0394, +0.0)   
+}
 
 # 센서 허용 측정 범위
 CO2_MIN = 0
@@ -38,17 +43,19 @@ class PortSelectionDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.selected_ports = []
-        self.comboboxes = []  # [수정] 콤보박스 리스트 초기화
+        self.port_rows = []  # 각 포트 설정 행(QWidget)을 관리하는 리스트
 
         self.setWindowTitle("CO2 센서 포트 설정")
+        self.resize(360, 250)
         self.initUI()
-        self.refresh_ports()  # 초기 포트 로드
+        self.refresh_all_ports()  # 초기 포트 로드
 
     def initUI(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(20, 20, 20, 20)
+        self.main_layout.setSpacing(12)
 
+        # 상단 타이틀 및 새로고침 버튼
         top_layout = QHBoxLayout()
         title = QLabel("CO2 센서 COM 포트 선택")
         title.setFont(QFont("Malgun Gothic", 12, QFont.Bold))
@@ -56,66 +63,130 @@ class PortSelectionDialog(QDialog):
         self.refresh_btn = QPushButton("🔄 새로고침")
         self.refresh_btn.setFont(QFont("Malgun Gothic", 9))
         self.refresh_btn.setStyleSheet("padding: 4px 8px; border: 1px solid #ccc; border-radius: 4px;")
-        self.refresh_btn.clicked.connect(self.refresh_ports)
+        self.refresh_btn.clicked.connect(self.refresh_all_ports)
 
         top_layout.addWidget(title)
         top_layout.addStretch(1)
         top_layout.addWidget(self.refresh_btn)
-        layout.addLayout(top_layout)
+        self.main_layout.addLayout(top_layout)
 
-        for i in range(3):
-            row_layout = QHBoxLayout()
-            label = QLabel(f"센서 {i+1} 포트:")
-            label.setFont(QFont("Malgun Gothic", 10))
-            
-            combo = QComboBox()
-            combo.setStyleSheet("padding: 5px; border: 1px solid gray; border-radius: 3px;")
-            
-            self.comboboxes.append(combo)
-            row_layout.addWidget(label)
-            row_layout.addWidget(combo)
-            layout.addLayout(row_layout)
+        # 포트 선택 행들이 들어갈 컨테이너 레이아웃
+        self.ports_layout = QVBoxLayout()
+        self.ports_layout.setSpacing(8)
+        self.main_layout.addLayout(self.ports_layout)
+
+        # 기본으로 3개 행 추가 (초기 상태)
+        for _ in range(3):
+            self.add_port_row()
+
+        # 하단 버튼 영역 (+ 센서 추가 버튼, 모니터링 시작 버튼)
+        self.add_btn = QPushButton("+ 센서 추가")
+        self.add_btn.setFixedHeight(30)
+        self.add_btn.setFont(QFont("Malgun Gothic", 9))
+        self.add_btn.setStyleSheet("background-color: #6C757D; color: white; border-radius: 4px;")
+        self.add_btn.clicked.connect(self.add_port_row)
+        self.main_layout.addWidget(self.add_btn)
 
         self.start_btn = QPushButton("모니터링 시작")
         self.start_btn.setFixedHeight(40)
         self.start_btn.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
         self.start_btn.setStyleSheet("background-color: #007BFF; color: white; border-radius: 5px;")
         self.start_btn.clicked.connect(self.on_start_clicked)
-        layout.addWidget(self.start_btn)
+        self.main_layout.addWidget(self.start_btn)
 
-    # [신규 추가] 연결된 포트 새로고침 기능
-    def refresh_ports(self):
+    def add_port_row(self):
+        """포트 선택 행을 동적으로 추가"""
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+
+        sensor_idx = len(self.port_rows) + 1
+        label = QLabel(f"센서 {sensor_idx} 포트:")
+        label.setFont(QFont("Malgun Gothic", 10))
+        label.setFixedWidth(80)
+
+        combo = QComboBox()
+        combo.setStyleSheet("padding: 5px; border: 1px solid gray; border-radius: 3px;")
+
+        del_btn = QPushButton("✕")
+        del_btn.setFixedSize(28, 28)
+        del_btn.setStyleSheet("background-color: #DC3545; color: white; border-radius: 3px; font-weight: bold;")
+        del_btn.clicked.connect(lambda: self.remove_port_row(row_widget))
+
+        row_layout.addWidget(label)
+        row_layout.addWidget(combo)
+        row_layout.addWidget(del_btn)
+
+        self.ports_layout.addWidget(row_widget)
+        self.port_rows.append({"widget": row_widget, "label": label, "combo": combo})
+
+        # 새로 추가된 콤보박스에 최신 포트 목록 채우기
+        self.refresh_combo_ports(combo)
+        self.update_labels()
+
+    def remove_port_row(self, row_widget):
+        """포트 선택 행 삭제"""
+        if len(self.port_rows) <= 1:
+            QMessageBox.warning(self, "경고", "최소 1개 이상의 센서는 유지해야 합니다.")
+            return
+
+        for item in self.port_rows:
+            if item["widget"] == row_widget:
+                self.port_rows.remove(item)
+                row_widget.deleteLater()
+                break
+
+        self.update_labels()
+
+    def update_labels(self):
+        """행 삭제/추가 시 센서 번호 갱신 (센서 1, 센서 2...)"""
+        for idx, item in enumerate(self.port_rows):
+            item["label"].setText(f"센서 {idx + 1} 포트:")
+
+    def refresh_combo_ports(self, combo):
+        """단일 콤보박스 포트 목록 갱신"""
         available_ports = [p.device for p in serial.tools.list_ports.comports()]
-        if not available_ports:
-            available_ports = ["연결된 포트 없음"]
+        port_options = ["선택 안함"] + available_ports if available_ports else ["선택 안함", "연결된 포트 없음"]
 
-        for i, combo in enumerate(self.comboboxes):
+        current_text = combo.currentText()
+        combo.clear()
+        combo.addItems(port_options)
+
+        if current_text in port_options:
+            combo.setCurrentText(current_text)
+        else:
+            combo.setCurrentIndex(0)
+
+    def refresh_all_ports(self):
+        """전체 콤보박스 새로고침 및 기본 포트 자동 할당"""
+        available_ports = [p.device for p in serial.tools.list_ports.comports()]
+        
+        for i, item in enumerate(self.port_rows):
+            combo = item["combo"]
             current_text = combo.currentText()
-            combo.clear()
-            combo.addItems(available_ports)
-            
-            # 기존 선택 포트 유지, 없으면 0, 1, 2 순으로 기본 선택
-            if current_text in available_ports:
+            self.refresh_combo_ports(combo)
+
+            # 기존 선택이 유지 가능한 경우 유지, 아니면 사용 가능한 포트를 순서대로 자동 배치
+            if current_text in [p.device for p in serial.tools.list_ports.comports()]:
                 combo.setCurrentText(current_text)
-            elif len(available_ports) > i and available_ports[0] != "연결된 포트 없음":
-                combo.setCurrentIndex(i)
+            elif len(available_ports) > i:
+                combo.setCurrentText(available_ports[i])
 
     def on_start_clicked(self):
-        ports = [combo.currentText() for combo in self.comboboxes]
-        
-        # '연결된 포트 없음'이 선택되었는지 확인
-        if "연결된 포트 없음" in ports:
-            QMessageBox.warning(self, "경고", "센서가 제대로 연결되지 않았습니다.\nUSB 연결을 확인해주세요.")
+        raw_ports = [item["combo"].currentText() for item in self.port_rows]
+        valid_ports = [p for p in raw_ports if p not in ["선택 안함", "연결된 포트 없음"]]
+
+        if not valid_ports:
+            QMessageBox.warning(self, "경고", "최소 하나 이상의 센서 포트를 선택해주세요.")
             return
-            
-        # 중복 포트 선택 방지 (옵션: 테스트 시 같은 포트를 쓰려면 이 부분 주석 처리)
-        if len(set(ports)) != len(ports):
+
+        if len(set(valid_ports)) != len(valid_ports):
             reply = QMessageBox.question(self, "확인", "중복된 포트가 선택되었습니다.\n그래도 진행하시겠습니까?", QMessageBox.Yes | QMessageBox.No)
             if reply == QMessageBox.No:
                 return
 
-        self.selected_ports = ports
-        self.accept()  # 다이얼로그 닫고 메인으로 진행
+        self.selected_ports = valid_ports
+        self.accept()
 
     def get_selected_ports(self):
         return self.selected_ports
@@ -241,12 +312,12 @@ class SerialThread(QThread):
                             continue
 
                         if parsed is not None:
-                            current_offset = SENSOR_OFFSETS.get(self.sensor_index, 0.0)
-                            if parsed <= current_offset:
-                                calibrated_co2_value = parsed  
-                            else:
-                                calibrated_co2_value = parsed + current_offset
-                            
+                            # 1. 해당 센서의 (기울기, 절편) 가져오기 (설정이 없으면 기본값 1.0, 0.0)
+                            slope, offset = SENSOR_CALIB_PARAMS.get(self.sensor_index, (1.0, 0.0))
+    
+                            # 2. 2점 보정 공식 적용: (Raw * 기울기) + 절편
+                            calibrated_co2_value = (parsed * slope) + offset
+    
                             last_data_time = current_time
                             self.last_recorded_status = "정상"
 
@@ -361,7 +432,7 @@ class CO2LevelWidget(QWidget): #사랑넷 원하는 기준표
         self.initUI()
 
     def initUI(self):
-        self.setStyleSheet("background-color: white; border-radius: 10px;")
+        self.setStyleSheet("background-color: transparent; border: none;")
         main_layout = QVBoxLayout(self)
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(5)
@@ -499,10 +570,15 @@ class CO2LevelWidget(QWidget): #사랑넷 원하는 기준표
         bar_width = target_bar.geometry().width()
 
         target_x = bar_x + (bar_width * ratio)
-        arrow_x = target_x - (self.arrow_label.width() / 2)
+        arrow_x = int(target_x - (self.arrow_label.width() / 2))
+        
+        # 화살표가 컨테이너 밖으로 나가지 않도록 최소 0, 최대(컨테이너 너비 - 화살표 너비)로 제한(Clamping)
+        max_x = self.arrow_container.width() - self.arrow_label.width()
+        arrow_x = max(0, min(arrow_x, max_x))
+        
         arrow_y = self.arrow_container.height() - self.arrow_label.height()
 
-        self.arrow_label.move(QPoint(int(arrow_x), int(arrow_y)))
+        self.arrow_label.move(QPoint(arrow_x, int(arrow_y)))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -522,9 +598,13 @@ class CO2MonitorApp(QMainWindow):
 
     def initUI(self):
         self.setWindowTitle("이산화탄소 다중 모니터링")
-        self.resize(780, 360) 
-        self.setStyleSheet("QMainWindow { background-color: white; border: none; }") 
-
+        
+        # [수정] 선택된 포트 개수에 맞춰 창 가로 너비를 동적으로 계산 (1개당 약 260px)
+        num_ports = len(self.target_ports)
+        window_width = max(280, num_ports * 260)
+        self.resize(window_width, 360) 
+        
+        self.setStyleSheet("QMainWindow { background-color: #E9ECEF; border: none; }") 
         self.setWindowFlags(Qt.FramelessWindowHint)
 
         central_widget = QWidget()
@@ -535,7 +615,6 @@ class CO2MonitorApp(QMainWindow):
 
         self.widgets = []
         for i, port in enumerate(self.target_ports):
-            # 타이틀에 할당된 포트 번호도 작게 표시하여 헷갈리지 않게 함
             widget = CO2LevelWidget(sensor_index=i, title=f"센서 {i+1} ({port})") 
             self.widgets.append(widget)
             main_layout.addWidget(widget)
