@@ -23,12 +23,15 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 class Config:
     BAUD_RATE = 9600
     # 센서 포트별 [PM10 보정값, PM2.5 보정값, PM1.0 보정값]
-    SENSOR_OFFSETS = {
-        0: (0.0, 0.0, 0.0),
-        1: (0.0, 0.0, 0.0),
-        2: (0.0, 0.0, 0.0),
-        3: (0.0, 0.0, 0.0),
+    # 센서 포트별 [(PM10 Scale, Offset), (PM2.5 Scale, Offset), (PM1.0 Scale, Offset)]
+    # Scale 기본값 = 1.0 (변화 없음), Offset 기본값 = 0.0 즉 최종값 = max(0,(Raw 값 + Offset)*Scale)
+    SENSOR_CALIBRATION = {
+        0: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
+        1: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
+        2: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
+        3: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
     }
+    
     SMOOTHING_WINDOW = 1
     NO_DATA_TIMEOUT = 30.0
     RECONNECT_DELAY_MS = 3000
@@ -62,25 +65,40 @@ class Config:
 # ==========================================
 # 2. 데이터 파싱 로직 (Data Parser)
 # ==========================================
+# ==========================================
+# 2. 데이터 파싱 로직 (Data Parser)
+# ==========================================
 class DustParser:
+
     @staticmethod
-    def parse(raw_data, offsets):
+    def parse(raw_data, calib_params):
         try:
             raw_data = raw_data.strip()
             if not raw_data:
                 return None
 
-            parts = [item.strip() for item in raw_data.replace(" ", "").split(",")]
+            parts = [
+                item.strip() for item in raw_data.replace(" ", "").split(",")
+            ]
             if len(parts) < 3:
                 return None
 
-            # 튜플로 전달받은 3개의 보정값을 각각 변수에 분리
+            # calib_params = {"scale": (s10, s25, s1), "offset": (o10, o25, o1)}
+            scales = calib_params.get("scale", (1.0, 1.0, 1.0))
+            offsets = calib_params.get("offset", (0.0, 0.0, 0.0))
+
+            scale_pm10, scale_pm25, scale_pm1 = scales
             offset_pm10, offset_pm25, offset_pm1 = offsets
 
-            # 각각의 보정값을 개별적으로 적용
-            pm10 = max(0, int(round(float(parts[2]) + offset_pm10)))
-            pm25 = max(0, int(round(float(parts[1]) + offset_pm25)))
-            pm1 = max(0, int(round(float(parts[0]) + offset_pm1)))
+            # Raw 데이터 읽기
+            raw_pm10 = float(parts[2])
+            raw_pm25 = float(parts[1])
+            raw_pm1 = float(parts[0])
+
+            # 비율 보정 및 오프셋 적용 공식: max(0, int(round((raw + offset) * scale)))
+            pm10 = max(0, int(round((raw_pm10 + offset_pm10) * scale_pm10)))
+            pm25 = max(0, int(round((raw_pm25 + offset_pm25) * scale_pm25)))
+            pm1 = max(0, int(round((raw_pm1 + offset_pm1) * scale_pm1)))
 
             if pm1 > 1000 or pm25 > 1000 or pm10 > 2000:
                 return "OUT_OF_RANGE"
@@ -171,10 +189,13 @@ class SerialThread(QThread):
     def __init__(self, port_name, sensor_index):
         super().__init__()
         self.port_name = port_name
-        
-        # 단일 값이 아닌 튜플(3개 값)을 통째로 가져옴 (기본값도 튜플로)
-        self.offsets = Config.SENSOR_OFFSETS.get(sensor_index, (0.0, 0.0, 0.0))
-        
+
+        # scale과 offset을 담은 딕셔너리를 통째로 전달
+        default_calib = {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)}
+        self.calib_params = Config.SENSOR_CALIBRATION.get(
+            sensor_index, default_calib
+        )
+
         self.logger = SensorLogger(port_name, sensor_index)
         self.data_buffer = {"pm10": [], "pm25": [], "pm1": []}
         self.minute_data_buffer = {"pm10": [], "pm25": [], "pm1": []}
@@ -214,13 +235,15 @@ class SerialThread(QThread):
                 last_data_time = time.time()
 
                 while ser.is_open and not self.isInterruptionRequested():
-                    # 1. 데이터 수신 및 파싱 (틱 동안 들어온 값을 전부 수집)
+                    # 1. 데이터 수신 및 파싱
                     parsed_values = []
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
-                        if not raw_data: continue
+                        if not raw_data:
+                            continue
 
-                        parsed = DustParser.parse(raw_data, self.offsets)
+                        # self.offsets -> self.calib_params 로 수정
+                        parsed = DustParser.parse(raw_data, self.calib_params)
                         if parsed == "OUT_OF_RANGE":
                             self.error_signal.emit(self.port_name, "측정값 범위 초과")
                             self.logger.write_error(f"범위 초과 Raw: {raw_data}")
@@ -228,7 +251,6 @@ class SerialThread(QThread):
                         elif parsed is not None:
                             parsed_values.append(parsed)
                             last_data_time = time.time()
-
 
                     # 2. 타임아웃 체크
                     if time.time() - last_data_time >= Config.NO_DATA_TIMEOUT:
@@ -244,46 +266,52 @@ class SerialThread(QThread):
 
                         for pm10, pm25, pm1 in parsed_values:
                             for key, val in zip(["pm10", "pm25", "pm1"], (pm10, pm25, pm1)):
-                                self.minute_data_buffer[key].append(val)  # CSV 평균용: 전부 누적
-                                self.data_buffer[key].append(val)          # 화면 표시용
+                                self.minute_data_buffer[key].append(val)
+                                self.data_buffer[key].append(val)
                                 if len(self.data_buffer[key]) > Config.SMOOTHING_WINDOW:
                                     self.data_buffer[key].pop(0)
 
                         if time.time() - last_ui_update_time >= 1.0:
                             last_ui_update_time = time.time()
-                            avgs = [int(sum(self.data_buffer[k]) / len(self.data_buffer[k])) for k in ["pm10", "pm25", "pm1"]]
+                            avgs = [
+                                int(sum(self.data_buffer[k]) / len(self.data_buffer[k]))
+                                for k in ["pm10", "pm25", "pm1"]
+                            ]
                             self.data_signal.emit(self.port_name, *avgs)
-
 
                     # 4. 분 단위 CSV 저장
                     current_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
                     if current_minute_key != last_saved_minute_key:
-                        # 반환값이 True(성공)일 때만 버퍼를 비움
-                        is_saved = self.logger.save_minute_data(last_saved_minute_key, self.minute_data_buffer)
+                        is_saved = self.logger.save_minute_data(
+                            last_saved_minute_key, self.minute_data_buffer
+                        )
                         if is_saved:
                             for key in self.minute_data_buffer:
                                 self.minute_data_buffer[key].clear()
-                        
-                        # 키 업데이트는 저장 여부와 상관없이 진행하여 무한루프 방지
+
                         last_saved_minute_key = current_minute_key
 
                     self.safe_sleep(100)
 
             except serial.SerialException as e:
-                if is_connected: self.logger.write_error(f"시리얼 통신 오류: {e}")
+                if is_connected:
+                    self.logger.write_error(f"시리얼 통신 오류: {e}")
                 is_connected = False
                 self.clear_buffers()
                 self.error_signal.emit(self.port_name, "연결 실패/끊김")
             except Exception:
-                if is_connected: self.logger.write_error("시스템 오류:\n" + traceback.format_exc())
+                if is_connected:
+                    self.logger.write_error("시스템 오류:\n" + traceback.format_exc())
                 is_connected = False
                 self.clear_buffers()
                 self.error_signal.emit(self.port_name, "시스템 오류")
             finally:
                 if ser is not None:
                     try:
-                        if ser.is_open: ser.close()
-                    except Exception: pass
+                        if ser.is_open:
+                            ser.close()
+                    except Exception:
+                        pass
                 if not self.isInterruptionRequested():
                     self.safe_sleep(Config.RECONNECT_DELAY_MS)
 
