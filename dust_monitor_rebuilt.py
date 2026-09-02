@@ -1,4 +1,6 @@
 import csv
+import sqlite3
+from datetime import datetime
 from datetime import datetime
 import sys
 import os
@@ -103,7 +105,12 @@ class DustParser:
             if pm1 > 1000 or pm25 > 1000 or pm10 > 2000:
                 return "OUT_OF_RANGE"
 
-            return pm10, pm25, pm1
+            return {
+                "raw": {"pm10": raw_pm10, "pm25": raw_pm25, "pm1": raw_pm1,
+                        },
+                "value": {"pm10": pm10, "pm25": pm25, "pm1": pm1,
+                          }
+                }
         except Exception:
             return None
 
@@ -116,15 +123,66 @@ class SensorLogger:
     def __init__(self, port_name, sensor_index):
         self.port_name = port_name
         self.sensor_index = sensor_index
+        
         self.log_dir = os.path.join(BASE_DIR, "Logs")
         self.csv_dir = os.path.join(BASE_DIR, "CSV_Logs")
+        self.db_dir = os.path.join(BASE_DIR, "Data")
+        
         os.makedirs(self.log_dir, exist_ok=True)
         os.makedirs(self.csv_dir, exist_ok=True)
+        os.makedirs(self.db_dir, exist_ok=True)
+
+        self.db_path = os.path.join(
+            self.db_dir, "dust_measurement.db")
+
+        self.init_database()
 
         if not SensorLogger._cleanup_done:
             self.cleanup_old_logs()
             SensorLogger._cleanup_done = True
+            
+# ==========================================
+# SQLite 초기화
+# ==========================================
+    def init_database(self):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # 동시성 성능을 크게 높여주는 WAL 모드 활성화
+                conn.execute("PRAGMA journal_mode=WAL;")
+                
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS measurements (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        measured_at TEXT NOT NULL,
+                        sensor_index INTEGER NOT NULL,
+                        port TEXT NOT NULL,
+                        raw_pm10 REAL,
+                        raw_pm25 REAL,
+                        raw_pm1 REAL,
+                        pm10 REAL,
+                        pm25 REAL,
+                        pm1 REAL,
+                        status TEXT DEFAULT 'NORMAL'
+                    )
+                """)
 
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_measurements_time
+                    ON measurements(measured_at)
+                """)
+
+                conn.execute("""
+                    CREATE INDEX IF NOT EXISTS idx_measurements_sensor
+                    ON measurements(sensor_index)
+                """)
+
+                conn.commit()
+
+        except Exception as e:
+            self.write_error(f"SQLite 초기화 오류: {e}")
+    # ==========================================
+    # 오류 로그
+    # ==========================================
 
     def write_error(self, message):
         log_file = os.path.join(self.log_dir, f"error_log_Sensor{self.sensor_index + 1}.txt")
@@ -135,47 +193,199 @@ class SensorLogger:
         except Exception:
             pass
 
-    def save_minute_data(self, minute_key, buffers):
-        if not buffers["pm1"]:
-            return True  # 저장할 데이터가 없으면 성공(True)으로 간주
-
+    # ==========================================
+    # 측정 데이터 SQLite 저장
+    # ==========================================
+    def save_measurement(
+        self,
+        measured_at,
+        raw_pm10,
+        raw_pm25,
+        raw_pm1,
+        pm10,
+        pm25,
+        pm1,
+        status="NORMAL"
+    ):
         try:
-            avg_pm10 = round(sum(buffers["pm10"]) / len(buffers["pm10"]), 1)
-            avg_pm25 = round(sum(buffers["pm25"]) / len(buffers["pm25"]), 1)
-            avg_pm1 = round(sum(buffers["pm1"]) / len(buffers["pm1"]), 1)
+            with sqlite3.connect(self.db_path) as conn:
 
-            saved_dt = datetime.strptime(minute_key, "%Y-%m-%d %H:%M")
-            date_str = saved_dt.strftime("%Y-%m-%d")
-            time_str = saved_dt.strftime("%H:%M:00")
+                conn.execute("""
+                    INSERT INTO measurements (
+                        measured_at,
+                        sensor_index,
+                        port,
 
-            file_path = os.path.join(self.csv_dir, f"Dust_log_{date_str}_Sensor{self.sensor_index + 1}.csv")
-            file_exists = os.path.exists(file_path)
+                        raw_pm10,
+                        raw_pm25,
+                        raw_pm1,
 
-            with open(file_path, mode="a", newline="", encoding="utf-8-sig") as f:
-                writer = csv.writer(f)
-                if not file_exists:
-                    writer.writerow(["측정일자", "측정시간", "포트", "PM10_평균", "PM2.5_평균", "PM1.0_평균"])
-                writer.writerow([date_str, time_str, self.port_name, avg_pm10, avg_pm25, avg_pm1])
-            return True  # 저장 성공 시 True 반환
+                        pm10,
+                        pm25,
+                        pm1,
 
-        except PermissionError:
-            self.write_error("CSV 접근 거부 (엑셀 등으로 파일이 열려있는지 확인하세요). 데이터를 보존합니다.")
-            return False  # 권한 에러 발생 시 버퍼를 유지하기 위해 False 반환
+                        status
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    measured_at,
+                    self.sensor_index,
+                    self.port_name,
+
+                    raw_pm10,
+                    raw_pm25,
+                    raw_pm1,
+
+                    pm10,
+                    pm25,
+                    pm1,
+
+                    status
+                ))
+
+                conn.commit()
+
+            return True
+
         except Exception as e:
-            self.write_error(f"CSV 저장 오류: {e}")
+            self.write_error(
+                f"SQLite 측정 데이터 저장 오류: {e}"
+            )
             return False
 
+    # ==========================================
+    # SQLite → CSV Export
+    # ==========================================
+    def export_csv(self, date_str=None):
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+
+                if date_str:
+                    rows = conn.execute("""
+                        SELECT
+                            measured_at,
+                            port,
+                            raw_pm10,
+                            raw_pm25,
+                            raw_pm1,
+                            pm10,
+                            pm25,
+                            pm1,
+                            status
+                        FROM measurements
+                        WHERE measured_at LIKE ?
+                        ORDER BY measured_at
+                    """, (
+                        f"{date_str}%",
+                    )).fetchall()
+
+                else:
+                    rows = conn.execute("""
+                        SELECT
+                            measured_at,
+                            port,
+                            raw_pm10,
+                            raw_pm25,
+                            raw_pm1,
+                            pm10,
+                            pm25,
+                            pm1,
+                            status
+                        FROM measurements
+                        ORDER BY measured_at
+                    """).fetchall()
+
+            if date_str:
+                filename = (
+                    f"Dust_log_{date_str}"
+                    f"_Sensor{self.sensor_index + 1}.csv"
+                )
+            else:
+                filename = (
+                    f"Dust_log_Sensor"
+                    f"{self.sensor_index + 1}.csv"
+                )
+
+            file_path = os.path.join(
+                self.csv_dir,
+                filename
+            )
+
+            with open(
+                file_path,
+                "w",
+                newline="",
+                encoding="utf-8-sig"
+            ) as f:
+
+                writer = csv.writer(f)
+
+                writer.writerow([
+                    "측정일시",
+                    "포트",
+
+                    "Raw_PM10",
+                    "Raw_PM2.5",
+                    "Raw_PM1.0",
+
+                    "PM10",
+                    "PM2.5",
+                    "PM1.0",
+
+                    "상태"
+                ])
+
+                writer.writerows(rows)
+
+            return True
+
+        except Exception as e:
+            self.write_error(
+                f"CSV Export 오류: {e}"
+            )
+            return False
+
+    # ==========================================
+    # 오래된 로그 정리
+    # ==========================================
     def cleanup_old_logs(self):
-        threshold_time = time.time() - (Config.LOG_RETENTION_DAYS * 24 * 60 * 60)
-        for target_dir in [self.log_dir, self.csv_dir]:
+
+        threshold_time = (
+            time.time()
+            - (
+                Config.LOG_RETENTION_DAYS
+                * 24
+                * 60
+                * 60
+            )
+        )
+
+        for target_dir in [
+            self.log_dir,
+            self.csv_dir
+        ]:
+
             if not os.path.exists(target_dir):
                 continue
+
             for filename in os.listdir(target_dir):
-                file_path = os.path.join(target_dir, filename)
+
+                file_path = os.path.join(
+                    target_dir,
+                    filename
+                )
+
                 if os.path.isfile(file_path):
+
                     try:
-                        if os.path.getmtime(file_path) < threshold_time:
+
+                        if (
+                            os.path.getmtime(file_path)
+                            < threshold_time
+                        ):
                             os.remove(file_path)
+
                     except Exception:
                         pass
 
@@ -264,7 +474,27 @@ class SerialThread(QThread):
                     elif parsed_values:
                         no_data_error_sent = False
 
-                        for pm10, pm25, pm1 in parsed_values:
+                        for parsed in parsed_values:
+                            raw = parsed["raw"]
+                            value = parsed["value"]
+                            pm10 = value["pm10"]
+                            pm25 = value["pm25"]
+                            pm1 = value["pm1"]
+
+    # --------------------------------
+    # SQLite 원본 측정 데이터 저장
+    # --------------------------------
+
+                            self.logger.save_measurement(
+                                measured_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+                                raw_pm10=raw["pm10"],
+                                raw_pm25=raw["pm25"],
+                                raw_pm1=raw["pm1"],
+                                pm10=pm10,
+                                pm25=pm25,
+                                pm1=pm1,
+                                status="NORMAL")
+                            
                             for key, val in zip(["pm10", "pm25", "pm1"], (pm10, pm25, pm1)):
                                 self.minute_data_buffer[key].append(val)
                                 self.data_buffer[key].append(val)
@@ -278,18 +508,6 @@ class SerialThread(QThread):
                                 for k in ["pm10", "pm25", "pm1"]
                             ]
                             self.data_signal.emit(self.port_name, *avgs)
-
-                    # 4. 분 단위 CSV 저장
-                    current_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
-                    if current_minute_key != last_saved_minute_key:
-                        is_saved = self.logger.save_minute_data(
-                            last_saved_minute_key, self.minute_data_buffer
-                        )
-                        if is_saved:
-                            for key in self.minute_data_buffer:
-                                self.minute_data_buffer[key].clear()
-
-                        last_saved_minute_key = current_minute_key
 
                     self.safe_sleep(100)
 
@@ -314,6 +532,7 @@ class SerialThread(QThread):
                         pass
                 if not self.isInterruptionRequested():
                     self.safe_sleep(Config.RECONNECT_DELAY_MS)
+                    
 
 
 # ==========================================
@@ -571,14 +790,15 @@ class DustMonitorApp(QMainWindow):
             widgets["pm1"].set_error_state(error_msg)
 
     def closeEvent(self, event):
-        # 1. 모든 스레드에 정지 신호(Interruption)를 먼저 동시에 보냄
-        for thread in self.threads: 
+        for thread in self.threads:
             thread.requestInterruption()
-            
-        # 2. 모든 스레드가 종료될 때까지 대기 (스레드가 내부에서 safe_sleep 중이므로 즉시 종료됨)
-        for thread in self.threads: 
-            # 1500ms(1.5초)가 아니라, 짧은 유예 시간만 주거나 인자 없이 기다림
-            thread.wait(500) 
+        
+        for thread in self.threads:
+            thread.wait(2000)
+    
+        # 종료할 때 각 센서별로 CSV 내보내기 실행
+        for thread in self.threads:
+            thread.logger.export_csv()
             
         event.accept()
 
