@@ -7,11 +7,11 @@ import serial
 import time
 import traceback
 import serial.tools.list_ports
-
+from collections import deque
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QPushButton, QDialog, QMessageBox,
-    QListWidget, QListWidgetItem, QScrollArea, QGroupBox
+    QListWidget, QListWidgetItem, QScrollArea, QGroupBox, QComboBox
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont
@@ -26,12 +26,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ==========================================
 class Config:
     BAUD_RATE = 9600
-    # 센서 포트별 [PM10 보정값, PM2.5 보정값, PM1.0 보정값]
-    # 센서 포트별 [(PM10 Scale, Offset), (PM2.5 Scale, Offset), (PM1.0 Scale, Offset)]
-    # Scale 기본값 = 1.0 (변화 없음), Offset 기본값 = 0.0 즉 최종값 = max(0,(Raw 값 + Offset)*Scale)
     SENSOR_CALIBRATION = {
-        0: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
-        1: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
+        0: {"scale": (1.0, 2.0, 1.0), "offset": (0.0, 1.0, 0.0)},
+        1: {"scale": (1.0, 3.0, 1.0), "offset": (0.0, 1.0, 0.0)},
         2: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
         3: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
     }
@@ -69,11 +66,7 @@ class Config:
 # ==========================================
 # 2. 데이터 파싱 로직 (Data Parser)
 # ==========================================
-# ==========================================
-# 2. 데이터 파싱 로직 (Data Parser)
-# ==========================================
 class DustParser:
-
     @staticmethod
     def parse(raw_data, calib_params):
         try:
@@ -104,7 +97,6 @@ class DustParser:
             if pm1 > 1000 or pm25 > 1000 or pm10 > 2000:
                 return "OUT_OF_RANGE"
 
-            # raw 항목 제거 및 최종값만 반환
             return {
                 "pm10": pm10, 
                 "pm25": pm25, 
@@ -178,6 +170,23 @@ class SensorLogger:
         except Exception:
             pass
 
+    def save_measurements_batch(self, measurements):
+        if not measurements:
+            return True
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany("""
+                    INSERT INTO measurements (
+                        measured_at, sensor_index, port,
+                        pm10, pm25, pm1, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, measurements)
+                conn.commit()
+            return True
+        except Exception as e:
+            self.write_error(f"SQLite 일괄 저장 오류: {e}")
+            return False
+
     def save_measurement(self, measured_at, pm10, pm25, pm1, status="NORMAL"):
         try:
             with sqlite3.connect(self.db_path) as conn:
@@ -195,12 +204,10 @@ class SensorLogger:
 
     def export_excel(self, date_str=None):
         try:
-            # date_str이 주어지지 않았다면 오늘 날짜(YYYY-MM-DD)를 기본으로 사용
             if not date_str:
                 date_str = datetime.now().strftime("%Y-%m-%d")
 
             with sqlite3.connect(self.db_path) as conn:
-                # 특정 날짜(date_str)에 해당하는 데이터만 조회
                 rows = conn.execute("""
                     SELECT measured_at, port, pm10, pm25, pm1, status
                     FROM measurements 
@@ -208,11 +215,9 @@ class SensorLogger:
                     ORDER BY measured_at
                 """, (self.sensor_index, f"{date_str}%")).fetchall()
 
-            # 해당 날짜에 데이터가 없으면 파일 생성 안 함
             if not rows:
                 return False
 
-            # 파일명에 날짜 포함 (예: Dust_log_2026-06-07_Sensor1.xlsx)
             filename = f"Dust_log_{date_str}_Sensor{self.sensor_index + 1}.xlsx"
             file_path = os.path.join(self.excel_dir, filename)
 
@@ -224,7 +229,6 @@ class SensorLogger:
             ws.append(headers)
             ws.row_dimensions[1].height = 25
 
-            # 스타일 정의 
             thin_border = Border(
                 left=Side(style='thin', color='D3D3D3'), right=Side(style='thin', color='D3D3D3'),
                 top=Side(style='thin', color='D3D3D3'), bottom=Side(style='thin', color='D3D3D3')
@@ -278,22 +282,32 @@ class SensorLogger:
 # 4. 시리얼 통신 스레드 (Serial Thread)
 # ==========================================
 class SerialThread(QThread):
-    data_signal = pyqtSignal(str, int, int, int)
-    error_signal = pyqtSignal(str, str)
+    data_signal = pyqtSignal(int, int, int, int)
+    error_signal = pyqtSignal(int, str)
 
     def __init__(self, port_name, sensor_index):
         super().__init__()
         self.port_name = port_name
+        self.sensor_index = sensor_index
 
-        # scale과 offset을 담은 딕셔너리를 통째로 전달
         default_calib = {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)}
         self.calib_params = Config.SENSOR_CALIBRATION.get(
             sensor_index, default_calib
         )
 
         self.logger = SensorLogger(port_name, sensor_index)
-        self.data_buffer = {"pm10": [], "pm25": [], "pm1": []}
-        self.minute_data_buffer = {"pm10": [], "pm25": [], "pm1": []}
+        self.data_buffer = {
+            "pm10": deque(maxlen=Config.SMOOTHING_WINDOW), 
+            "pm25": deque(maxlen=Config.SMOOTHING_WINDOW), 
+            "pm1": deque(maxlen=Config.SMOOTHING_WINDOW)
+        }
+        # 리스트 대신 합계와 개수로 1분 평균 데이터 관리
+        self.minute_sum = {"pm10": 0, "pm25": 0, "pm1": 0}
+        self.minute_count = 0
+        
+        self.last_minute = datetime.now().minute       
+        # 1분 주기 평균 저장을 위한 시간 변수 추가
+        self.last_minute_save_time = time.time()
 
     def safe_sleep(self, ms):
         elapsed = 0
@@ -307,12 +321,35 @@ class SerialThread(QThread):
     def clear_buffers(self):
         for key in self.data_buffer:
             self.data_buffer[key].clear()
-            self.minute_data_buffer[key].clear()
+        
+        # 합계와 카운트 초기화로 변경
+        self.minute_sum = {"pm10": 0, "pm25": 0, "pm1": 0}
+        self.minute_count = 0
+
+    def save_current_minute_average(self):
+        # 데이터가 1건이라도 쌓였다면
+        if self.minute_count > 0:
+            avg_pm10 = int(self.minute_sum["pm10"] / self.minute_count)
+            avg_pm25 = int(self.minute_sum["pm25"] / self.minute_count)
+            avg_pm1 = int(self.minute_sum["pm1"] / self.minute_count)
+            
+            measured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            batch_data = [(
+                measured_at, self.sensor_index, self.port_name,
+                avg_pm10, avg_pm25, avg_pm1, "NORMAL"
+            )]
+            self.logger.save_measurements_batch(batch_data)
+            
+            # 저장 후 합계와 카운트 초기화
+            self.minute_sum = {"pm10": 0, "pm25": 0, "pm1": 0}
+            self.minute_count = 0
+            
+        self.last_minute_save_time = time.time()
 
     def run(self):
         is_connected = False
         no_data_error_sent = False
-        last_saved_minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
         last_ui_update_time = 0.0
         last_data_time = time.time()
 
@@ -328,34 +365,31 @@ class SerialThread(QThread):
                 is_connected = True
                 no_data_error_sent = False
                 last_data_time = time.time()
+                self.last_minute_save_time = time.time() # 연결 시점 초기화
 
                 while ser.is_open and not self.isInterruptionRequested():
-                    # 1. 데이터 수신 및 파싱
                     parsed_values = []
                     while ser.in_waiting > 0:
                         raw_data = ser.readline().decode("utf-8", errors="ignore").strip()
                         if not raw_data:
                             continue
 
-                        # self.offsets -> self.calib_params 로 수정
                         parsed = DustParser.parse(raw_data, self.calib_params)
                         if parsed == "OUT_OF_RANGE":
-                            self.error_signal.emit(self.port_name, "측정값 범위 초과")
+                            self.error_signal.emit(self.sensor_index, "측정값 범위 초과")
                             self.logger.write_error(f"범위 초과 Raw: {raw_data}")
                             continue
                         elif parsed is not None:
                             parsed_values.append(parsed)
                             last_data_time = time.time()
 
-                    # 2. 타임아웃 체크
                     if time.time() - last_data_time >= Config.NO_DATA_TIMEOUT:
                         if not no_data_error_sent:
-                            self.error_signal.emit(self.port_name, "데이터 없음")
+                            self.error_signal.emit(self.sensor_index, "데이터 없음")
                             self.logger.write_error("30초 이상 데이터 없음")
                             no_data_error_sent = True
                             self.clear_buffers()
 
-                    # 3. 정상 데이터 버퍼링 및 UI 업데이트
                     elif parsed_values:
                         no_data_error_sent = False
 
@@ -363,54 +397,37 @@ class SerialThread(QThread):
                             pm10 = parsed["pm10"]
                             pm25 = parsed["pm25"]
                             pm1 = parsed["pm1"]
-
-                            # SQLite 저장
-                            self.logger.save_measurement(
-                                measured_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-                                pm10=pm10,
-                                pm25=pm25,
-                                pm1=pm1,
-                                status="NORMAL"
-                            )
                             
+                            # 실시간 화면 표시용 버퍼 (기존 유지)
+                            for parsed in parsed_values:
+                                pm10 = parsed["pm10"]
+                                pm25 = parsed["pm25"]
+                                pm1 = parsed["pm1"]
+                            
+                            # 1. 화면 표시용 덱(deque) 버퍼
                             for key, val in zip(["pm10", "pm25", "pm1"], (pm10, pm25, pm1)):
-                                self.minute_data_buffer[key].append(val)
                                 self.data_buffer[key].append(val)
-                                if len(self.data_buffer[key]) > Config.SMOOTHING_WINDOW:
-                                    self.data_buffer[key].pop(0)
 
+                                # 1분 평균용 합계 및 개수 누적
+                                self.minute_sum["pm10"] += pm10
+                                self.minute_sum["pm25"] += pm25
+                                self.minute_sum["pm1"] += pm1
+                                self.minute_count += 1
+
+                        # 시스템 시각의 '분'이 바뀌었는지 체크
+                        current_minute = datetime.now().minute
+                        if current_minute != self.last_minute:
+                            self.save_current_minute_average()
+                            self.last_minute = current_minute
+
+                        # 화면 UI는 1초마다 실시간 갱신
                         if time.time() - last_ui_update_time >= 1.0:
                             last_ui_update_time = time.time()
                             avgs = [
                                 int(sum(self.data_buffer[k]) / len(self.data_buffer[k]))
                                 for k in ["pm10", "pm25", "pm1"]
                             ]
-                            self.data_signal.emit(self.port_name, *avgs)
-
-    # --------------------------------
-    # SQLite 원본 측정 데이터 저장
-    # --------------------------------
-
-                            self.logger.save_measurement(
-                                measured_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-                                pm10=pm10,
-                                pm25=pm25,
-                                pm1=pm1,
-                                status="NORMAL")
-                            
-                            for key, val in zip(["pm10", "pm25", "pm1"], (pm10, pm25, pm1)):
-                                self.minute_data_buffer[key].append(val)
-                                self.data_buffer[key].append(val)
-                                if len(self.data_buffer[key]) > Config.SMOOTHING_WINDOW:
-                                    self.data_buffer[key].pop(0)
-
-                        if time.time() - last_ui_update_time >= 1.0:
-                            last_ui_update_time = time.time()
-                            avgs = [
-                                int(sum(self.data_buffer[k]) / len(self.data_buffer[k]))
-                                for k in ["pm10", "pm25", "pm1"]
-                            ]
-                            self.data_signal.emit(self.port_name, *avgs)
+                            self.data_signal.emit(self.sensor_index, *avgs)
 
                     self.safe_sleep(100)
 
@@ -419,13 +436,13 @@ class SerialThread(QThread):
                     self.logger.write_error(f"시리얼 통신 오류: {e}")
                 is_connected = False
                 self.clear_buffers()
-                self.error_signal.emit(self.port_name, "연결 실패/끊김")
+                self.error_signal.emit(self.sensor_index, "연결 실패/끊김")
             except Exception:
                 if is_connected:
                     self.logger.write_error("시스템 오류:\n" + traceback.format_exc())
                 is_connected = False
                 self.clear_buffers()
-                self.error_signal.emit(self.port_name, "시스템 오류")
+                self.error_signal.emit(self.sensor_index, "시스템 오류")
             finally:
                 if ser is not None:
                     try:
@@ -435,71 +452,10 @@ class SerialThread(QThread):
                         pass
                 if not self.isInterruptionRequested():
                     self.safe_sleep(Config.RECONNECT_DELAY_MS)
-                    
-
 
 # ==========================================
-# 5. UI 위젯 및 앱 메인 로직 (기존과 동일)
+# 5. UI 위젯 및 앱 메인 로직
 # ==========================================
-class PortSelectionDialog(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("미세먼지 센서 포트 선택")
-        self.resize(350, 400)
-        self.setStyleSheet("background-color: white;")
-        self.selected_ports = []
-        self.initUI()
-        self.refresh_ports()
-
-    def initUI(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
-
-        title = QLabel("연결할 COM 포트를 모두 선택하세요")
-        title.setFont(QFont("Malgun Gothic", 11, QFont.Bold))
-        title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
-
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
-
-        refresh_btn = QPushButton("포트 새로고침")
-        refresh_btn.clicked.connect(self.refresh_ports)
-        layout.addWidget(refresh_btn)
-
-        self.start_btn = QPushButton("모니터링 시작")
-        self.start_btn.setFixedHeight(40)
-        self.start_btn.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
-        self.start_btn.setStyleSheet("background-color: #007BFF; color: white; border-radius: 5px;")
-        self.start_btn.clicked.connect(self.on_start_clicked)
-        layout.addWidget(self.start_btn)
-
-    def refresh_ports(self):
-        self.list_widget.clear()
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        if not ports:
-            item = QListWidgetItem("연결된 포트 없음")
-            item.setFlags(Qt.NoItemFlags)
-            self.list_widget.addItem(item)
-            return
-
-        for port in ports:
-            item = QListWidgetItem(port)
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
-            self.list_widget.addItem(item)
-
-    def on_start_clicked(self):
-        self.selected_ports = [self.list_widget.item(i).text() for i in range(self.list_widget.count()) if self.list_widget.item(i).checkState() == Qt.Checked]
-        if not self.selected_ports:
-            QMessageBox.warning(self, "경고", "최소 하나 이상의 포트를 선택해 주세요.")
-            return
-        if len(self.selected_ports) != len(set(self.selected_ports)):
-            QMessageBox.warning(self, "경고", "같은 COM 포트를 중복 선택할 수 없습니다.")
-            return
-        self.accept()
-
 class DustLevelWidget(QWidget):
     def __init__(self, title="미세먼지", levels=None, parent=None):
         super().__init__(parent)
@@ -615,44 +571,134 @@ class DustLevelWidget(QWidget):
 
         target_bar = self.level_bars[level_index]
         target_x = target_bar.geometry().x() + (target_bar.geometry().width() * ratio)
-        # 1. 화살표가 위치할 X 좌표 계산
         arrow_x = int(target_x - (self.arrow_label.width() / 2))
-        # 2. 화살표가 잘리지 않도록 최소 0, 최대 (컨테이너 너비 - 화살표 너비) 사이로 제한
         max_x = self.arrow_container.width() - self.arrow_label.width()
         arrow_x = max(0, min(arrow_x, max_x))
-        # 3. 제한된 좌표를 적용하여 화살표 이동
         self.arrow_label.move(QPoint(arrow_x, int(self.arrow_container.height() - self.arrow_label.height() + 2)))
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.update_arrow_position()
 
-class DustMonitorApp(QMainWindow):
-    def __init__(self, ports):
-        super().__init__()
-        self.ports = ports
-        self.threads = []
-        self.port_widgets = {}
+# ==========================================
+# 6. 포트 선택 팝업 다이얼로그
+# ==========================================
+class PortSelectionDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected_ports = {}
+        self.available_ports = [port.device for port in serial.tools.list_ports.comports()]
         self.initUI()
-        self.start_threads()
+
+    def initUI(self):
+        self.setWindowTitle("센서 포트 설정")
+        self.resize(350, 250)
+        self.setStyleSheet("background-color: white;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(15)
+
+        title_label = QLabel("모니터링할 센서 포트를 선택하세요")
+        title_label.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
+        layout.addWidget(title_label)
+
+        self.combos = []
+        for i in range(4):
+            h_layout = QHBoxLayout()
+            label = QLabel(f"센서 {i+1} 포트:")
+            label.setFont(QFont("Malgun Gothic", 9))
+            
+            combo = QComboBox()
+            combo.addItem("선택 안 함")
+            combo.addItems(self.available_ports)
+            combo.setFont(QFont("Malgun Gothic", 9))
+            # 포트 선택이 바뀔 때마다 다른 콤보박스 목록을 갱신하도록 연결
+            combo.currentIndexChanged.connect(self.update_combo_items)
+            
+            h_layout.addWidget(label)
+            h_layout.addWidget(combo)
+            layout.addLayout(h_layout)
+            self.combos.append(combo)
+
+        self.start_btn = QPushButton("모니터링 시작")
+        self.start_btn.setFixedHeight(35)
+        self.start_btn.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
+        self.start_btn.setStyleSheet("background-color: #007BFF; color: white; border-radius: 4px;")
+        self.start_btn.clicked.connect(self.accept_selection)
+        layout.addWidget(self.start_btn)
+
+    def update_combo_items(self):
+        # 현재 선택되어 있는 포트 목록 수집
+        selected_values = [
+            combo.currentText() for combo in self.combos 
+            if combo.currentText() and combo.currentText() != "선택 안 함"
+        ]
+
+        # 각 콤보박스의 선택 상태를 유지하면서 이미 다른 곳에서 선택된 포트는 목록에서 숨기거나 막기
+        for combo in self.combos:
+            current_selection = combo.currentText()
+            combo.blockSignals(True) # 시그널 루프 방지
+            combo.clear()
+            combo.addItem("선택 안 함")
+            
+            for port in self.available_ports:
+                # 다른 콤보박스에서 이미 골랐고, 현재 콤보박스에서 고른 게 아니라면 추가 안 함
+                if port in selected_values and port != current_selection:
+                    continue
+                combo.addItem(port)
+                
+            # 기존에 선택했던 값 복구 시도
+            index = combo.findText(current_selection)
+            if index != -1:
+                combo.setCurrentIndex(index)
+            else:
+                combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+
+    def accept_selection(self):
+        self.selected_ports = {
+            i: combo.currentText() for i, combo in enumerate(self.combos)
+            if combo.currentText() and combo.currentText() != "선택 안 함"
+        }
+        if not self.selected_ports:
+            QMessageBox.warning(self, "경고", "최소 하나 이상의 센서 포트를 선택해 주세요.")
+            return
+        self.accept()
+
+# ==========================================
+# 7. 메인 모니터링 창
+# ==========================================
+class DustMonitorApp(QMainWindow):
+    def __init__(self, slot_mapping):
+        super().__init__()
+        self.threads = []
+        self.sensor_widgets = {}
+        self.slot_mapping = slot_mapping
+        self.initUI()
+        self.start_monitoring()
 
     def initUI(self):
         self.setWindowTitle("다중 미세먼지 모니터링 시스템")
-        self.resize(1000, 700)
         self.setStyleSheet("QMainWindow { background-color: white; }")
+    
+    # 강제로 크기를 지정하는 대신 최소 크기만 설정
+        self.setMinimumSize(400, 150)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         self.setCentralWidget(scroll)
 
-        container = QWidget()
-        scroll.setWidget(container)
-        main_layout = QVBoxLayout(container)
-        main_layout.setContentsMargins(15, 15, 15, 15)
-        main_layout.setSpacing(15)
+        scroll_content = QWidget()
+        scroll.setWidget(scroll_content)
+        self.scroll_layout = QVBoxLayout(scroll_content)
+        self.scroll_layout.setContentsMargins(15, 15, 15, 15)
+        self.scroll_layout.setSpacing(15)
+        self.scroll_layout.addStretch(1)
 
-        for port in self.ports:
-            group_box = QGroupBox(f"센서 포트: {port}")
+    def start_monitoring(self):
+        for sensor_index, port_name in self.slot_mapping.items():
+            group_box = QGroupBox(f"센서 {sensor_index + 1} 포트: {port_name}")
             group_box.setFont(QFont("Malgun Gothic", 11, QFont.Bold))
             port_layout = QHBoxLayout(group_box)
             port_layout.setSpacing(10)
@@ -664,29 +710,29 @@ class DustMonitorApp(QMainWindow):
             port_layout.addWidget(w_pm10)
             port_layout.addWidget(w_pm25)
             port_layout.addWidget(w_pm1)
-            main_layout.addWidget(group_box)
+            
+            self.scroll_layout.insertWidget(self.scroll_layout.count() - 1, group_box)
+            self.sensor_widgets[sensor_index] = {"pm10": w_pm10, "pm25": w_pm25, "pm1": w_pm1}
 
-            self.port_widgets[port] = {"pm10": w_pm10, "pm25": w_pm25, "pm1": w_pm1}
-
-        main_layout.addStretch(1)
-
-    def start_threads(self):
-        for index, port in enumerate(self.ports):
-            thread = SerialThread(port, sensor_index=index)
+            thread = SerialThread(port_name, sensor_index)
             thread.data_signal.connect(self.update_data)
             thread.error_signal.connect(self.handle_error)
-            self.threads.append(thread)
             thread.start()
+            self.threads.append(thread)
 
-    def update_data(self, port, pm10, pm25, pm1):
-        widgets = self.port_widgets.get(port)
+        sensor_count = len(self.slot_mapping)
+        calculated_height = max(220, sensor_count * 245 + 60)
+        self.resize(980, calculated_height)
+
+    def update_data(self, sensor_index, pm10, pm25, pm1):
+        widgets = self.sensor_widgets.get(sensor_index)
         if widgets:
             widgets["pm10"].update_val(pm10)
             widgets["pm25"].update_val(pm25)
             widgets["pm1"].update_val(pm1)
 
-    def handle_error(self, port, error_msg):
-        widgets = self.port_widgets.get(port)
+    def handle_error(self, sensor_index, error_msg):
+        widgets = self.sensor_widgets.get(sensor_index)
         if widgets:
             widgets["pm10"].set_error_state(error_msg)
             widgets["pm25"].set_error_state(error_msg)
@@ -699,11 +745,8 @@ class DustMonitorApp(QMainWindow):
         for thread in self.threads:
             thread.wait(2000)
     
-        # [변경] 종료할 때 각 센서별로 엑셀 파일 내보내기 실행
         for thread in self.threads:
             thread.logger.export_excel()
-            
-        event.accept()
             
         event.accept()
 
@@ -721,13 +764,14 @@ class DustMonitorApp(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # [추가] 앱 시작 시 전역 DB 초기화 및 오래된 로그 정리 (중복 실행 방지)
     db_path = os.path.join(BASE_DIR, "Data", "dust_measurement.db")
     SensorLogger.init_global_database(db_path)
     SensorLogger.cleanup_old_logs_global()
 
-    setup_dialog = PortSelectionDialog()
-    if setup_dialog.exec_() == QDialog.Accepted:
-        window = DustMonitorApp(setup_dialog.selected_ports)
-        window.show()
+    dialog = PortSelectionDialog()
+    if dialog.exec_() == QDialog.Accepted:
+        main_window = DustMonitorApp(dialog.selected_ports)
+        main_window.show()
         sys.exit(app.exec_())
+    else:
+        sys.exit(0)
