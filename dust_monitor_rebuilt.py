@@ -1,7 +1,6 @@
 import csv
 import sqlite3
 from datetime import datetime
-from datetime import datetime
 import sys
 import os
 import serial
@@ -88,19 +87,16 @@ class DustParser:
             if len(parts) < 3:
                 return None
 
-            # calib_params = {"scale": (s10, s25, s1), "offset": (o10, o25, o1)}
             scales = calib_params.get("scale", (1.0, 1.0, 1.0))
             offsets = calib_params.get("offset", (0.0, 0.0, 0.0))
 
             scale_pm10, scale_pm25, scale_pm1 = scales
             offset_pm10, offset_pm25, offset_pm1 = offsets
 
-            # Raw 데이터 읽기
             raw_pm10 = float(parts[2])
             raw_pm25 = float(parts[1])
             raw_pm1 = float(parts[0])
 
-            # 비율 보정 및 오프셋 적용 공식: max(0, int(round((raw + offset) * scale)))
             pm10 = max(0, int(round((raw_pm10 + offset_pm10) * scale_pm10)))
             pm25 = max(0, int(round((raw_pm25 + offset_pm25) * scale_pm25)))
             pm1 = max(0, int(round((raw_pm1 + offset_pm1) * scale_pm1)))
@@ -108,12 +104,12 @@ class DustParser:
             if pm1 > 1000 or pm25 > 1000 or pm10 > 2000:
                 return "OUT_OF_RANGE"
 
+            # raw 항목 제거 및 최종값만 반환
             return {
-                "raw": {"pm10": raw_pm10, "pm25": raw_pm25, "pm1": raw_pm1,
-                        },
-                "value": {"pm10": pm10, "pm25": pm25, "pm1": pm1,
-                          }
-                }
+                "pm10": pm10, 
+                "pm25": pm25, 
+                "pm1": pm1
+            }
         except Exception:
             return None
 
@@ -126,7 +122,7 @@ class SensorLogger:
         self.sensor_index = sensor_index
         
         self.log_dir = os.path.join(BASE_DIR, "Logs")
-        self.excel_dir = os.path.join(BASE_DIR, "Excel_Logs") # CSV 대신 엑셀 폴더
+        self.excel_dir = os.path.join(BASE_DIR, "Excel_Logs")
         self.db_dir = os.path.join(BASE_DIR, "Data")
         
         os.makedirs(self.log_dir, exist_ok=True)
@@ -134,12 +130,9 @@ class SensorLogger:
         os.makedirs(self.db_dir, exist_ok=True)
 
         self.db_path = os.path.join(self.db_dir, "dust_measurement.db")
-        # ⚠️ init_database()와 cleanup_old_logs()는 여기서 호출하지 않고 외부(메인)로 뺍니다!
 
-    # [클래스 외부 혹은 전역 함수로 분리할 수도 있는 초기화/정리 함수들]
     @staticmethod
     def init_global_database(db_path):
-        """앱 시작 시 전체 단 한 번만 호출하여 DB 초기화 및 최적화"""
         try:
             with sqlite3.connect(db_path) as conn:
                 conn.execute("PRAGMA journal_mode=WAL;")
@@ -149,9 +142,6 @@ class SensorLogger:
                         measured_at TEXT NOT NULL,
                         sensor_index INTEGER NOT NULL,
                         port TEXT NOT NULL,
-                        raw_pm10 REAL,
-                        raw_pm25 REAL,
-                        raw_pm1 REAL,
                         pm10 REAL,
                         pm25 REAL,
                         pm1 REAL,
@@ -166,7 +156,6 @@ class SensorLogger:
 
     @staticmethod
     def cleanup_old_logs_global():
-        """앱 시작 시 오래된 로그 파일 정리"""
         threshold_time = time.time() - (Config.LOG_RETENTION_DAYS * 24 * 60 * 60)
         for target_dir in [os.path.join(BASE_DIR, "Logs"), os.path.join(BASE_DIR, "Excel_Logs")]:
             if not os.path.exists(target_dir):
@@ -189,16 +178,15 @@ class SensorLogger:
         except Exception:
             pass
 
-    def save_measurement(self, measured_at, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status="NORMAL"):
+    def save_measurement(self, measured_at, pm10, pm25, pm1, status="NORMAL"):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute("""
                     INSERT INTO measurements (
                         measured_at, sensor_index, port,
-                        raw_pm10, raw_pm25, raw_pm1,
                         pm10, pm25, pm1, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (measured_at, self.sensor_index, self.port_name, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status))
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (measured_at, self.sensor_index, self.port_name, pm10, pm25, pm1, status))
                 conn.commit()
             return True
         except Exception as e:
@@ -206,17 +194,16 @@ class SensorLogger:
             return False
 
     def export_excel(self, date_str=None):
-       
         try:
             with sqlite3.connect(self.db_path) as conn:
                 if date_str:
                     rows = conn.execute("""
-                        SELECT measured_at, port, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status
+                        SELECT measured_at, port, pm10, pm25, pm1, status
                         FROM measurements WHERE sensor_index = ? AND measured_at LIKE ? ORDER BY measured_at
                     """, (self.sensor_index, f"{date_str}%")).fetchall()
                 else:
                     rows = conn.execute("""
-                        SELECT measured_at, port, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status
+                        SELECT measured_at, port, pm10, pm25, pm1, status
                         FROM measurements WHERE sensor_index = ? ORDER BY measured_at
                     """, (self.sensor_index,)).fetchall()
 
@@ -230,11 +217,10 @@ class SensorLogger:
             ws = wb.active
             ws.title = "측정 데이터"
 
-            headers = ["측정일시", "포트", "Raw_PM10", "Raw_PM2.5", "Raw_PM1.0", "PM10", "PM2.5", "PM1.0", "상태"]
+            headers = ["측정일시", "포트", "PM10", "PM2.5", "PM1.0", "상태"]
             ws.append(headers)
             ws.row_dimensions[1].height = 25
 
-            # 스타일 정의
             thin_border = Border(
                 left=Side(style='thin', color='D3D3D3'), right=Side(style='thin', color='D3D3D3'),
                 top=Side(style='thin', color='D3D3D3'), bottom=Side(style='thin', color='D3D3D3')
@@ -262,15 +248,13 @@ class SensorLogger:
                     cell.font = data_font
                     cell.border = thin_border
 
-                    # 정렬 및 포맷팅
-                    if col_num in [1, 2, 9]:
+                    if col_num in [1, 2, 6]:
                         cell.alignment = center_align
                     else:
                         cell.alignment = right_align
                         if isinstance(val, (int, float)):
                             cell.number_format = '#,##0'
 
-            # 열 너비 자동 조절
             for col in ws.columns:
                 max_len = 0
                 col_letter = get_column_letter(col[0].column)
@@ -285,254 +269,6 @@ class SensorLogger:
         except Exception as e:
             self.write_error(f"Excel Export 오류: {e}")
             return False
-            
-# ==========================================
-# SQLite 초기화
-# ==========================================
-    def init_database(self):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                # 동시성 성능을 크게 높여주는 WAL 모드 활성화
-                conn.execute("PRAGMA journal_mode=WAL;")
-                
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS measurements (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        measured_at TEXT NOT NULL,
-                        sensor_index INTEGER NOT NULL,
-                        port TEXT NOT NULL,
-                        raw_pm10 REAL,
-                        raw_pm25 REAL,
-                        raw_pm1 REAL,
-                        pm10 REAL,
-                        pm25 REAL,
-                        pm1 REAL,
-                        status TEXT DEFAULT 'NORMAL'
-                    )
-                """)
-
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_measurements_time
-                    ON measurements(measured_at)
-                """)
-
-                conn.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_measurements_sensor
-                    ON measurements(sensor_index)
-                """)
-
-                conn.commit()
-
-        except Exception as e:
-            self.write_error(f"SQLite 초기화 오류: {e}")
-    # ==========================================
-    # 오류 로그
-    # ==========================================
-
-    def write_error(self, message):
-        log_file = os.path.join(self.log_dir, f"error_log_Sensor{self.sensor_index + 1}.txt")
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            with open(log_file, "a", encoding="utf-8-sig") as f:
-                f.write(f"{timestamp} | 포트: {self.port_name} | {message}\n")
-        except Exception:
-            pass
-
-    # ==========================================
-    # 측정 데이터 SQLite 저장
-    # ==========================================
-    def save_measurement(
-        self,
-        measured_at,
-        raw_pm10,
-        raw_pm25,
-        raw_pm1,
-        pm10,
-        pm25,
-        pm1,
-        status="NORMAL"
-    ):
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-
-                conn.execute("""
-                    INSERT INTO measurements (
-                        measured_at,
-                        sensor_index,
-                        port,
-
-                        raw_pm10,
-                        raw_pm25,
-                        raw_pm1,
-
-                        pm10,
-                        pm25,
-                        pm1,
-
-                        status
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    measured_at,
-                    self.sensor_index,
-                    self.port_name,
-
-                    raw_pm10,
-                    raw_pm25,
-                    raw_pm1,
-
-                    pm10,
-                    pm25,
-                    pm1,
-
-                    status
-                ))
-
-                conn.commit()
-
-            return True
-
-        except Exception as e:
-            self.write_error(
-                f"SQLite 측정 데이터 저장 오류: {e}"
-            )
-            return False
-
-    # ==========================================
-    # SQLite → CSV Export
-    # ==========================================
-    def export_csv(self, date_str=None):
-
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-
-                if date_str:
-                    rows = conn.execute("""
-                        SELECT
-                            measured_at,
-                            port,
-                            raw_pm10,
-                            raw_pm25,
-                            raw_pm1,
-                            pm10,
-                            pm25,
-                            pm1,
-                            status
-                        FROM measurements
-                        WHERE measured_at LIKE ?
-                        ORDER BY measured_at
-                    """, (
-                        f"{date_str}%",
-                    )).fetchall()
-
-                else:
-                    rows = conn.execute("""
-                        SELECT
-                            measured_at,
-                            port,
-                            raw_pm10,
-                            raw_pm25,
-                            raw_pm1,
-                            pm10,
-                            pm25,
-                            pm1,
-                            status
-                        FROM measurements
-                        ORDER BY measured_at
-                    """).fetchall()
-
-            if date_str:
-                filename = (
-                    f"Dust_log_{date_str}"
-                    f"_Sensor{self.sensor_index + 1}.csv"
-                )
-            else:
-                filename = (
-                    f"Dust_log_Sensor"
-                    f"{self.sensor_index + 1}.csv"
-                )
-
-            file_path = os.path.join(
-                self.csv_dir,
-                filename
-            )
-
-            with open(
-                file_path,
-                "w",
-                newline="",
-                encoding="utf-8-sig"
-            ) as f:
-
-                writer = csv.writer(f)
-
-                writer.writerow([
-                    "측정일시",
-                    "포트",
-
-                    "Raw_PM10",
-                    "Raw_PM2.5",
-                    "Raw_PM1.0",
-
-                    "PM10",
-                    "PM2.5",
-                    "PM1.0",
-
-                    "상태"
-                ])
-
-                writer.writerows(rows)
-
-            return True
-
-        except Exception as e:
-            self.write_error(
-                f"CSV Export 오류: {e}"
-            )
-            return False
-
-    # ==========================================
-    # 오래된 로그 정리
-    # ==========================================
-    def cleanup_old_logs(self):
-
-        threshold_time = (
-            time.time()
-            - (
-                Config.LOG_RETENTION_DAYS
-                * 24
-                * 60
-                * 60
-            )
-        )
-
-        for target_dir in [
-            self.log_dir,
-            self.csv_dir
-        ]:
-
-            if not os.path.exists(target_dir):
-                continue
-
-            for filename in os.listdir(target_dir):
-
-                file_path = os.path.join(
-                    target_dir,
-                    filename
-                )
-
-                if os.path.isfile(file_path):
-
-                    try:
-
-                        if (
-                            os.path.getmtime(file_path)
-                            < threshold_time
-                        ):
-                            os.remove(file_path)
-
-                    except Exception:
-                        pass
 
 # ==========================================
 # 4. 시리얼 통신 스레드 (Serial Thread)
@@ -620,11 +356,32 @@ class SerialThread(QThread):
                         no_data_error_sent = False
 
                         for parsed in parsed_values:
-                            raw = parsed["raw"]
-                            value = parsed["value"]
-                            pm10 = value["pm10"]
-                            pm25 = value["pm25"]
-                            pm1 = value["pm1"]
+                            pm10 = parsed["pm10"]
+                            pm25 = parsed["pm25"]
+                            pm1 = parsed["pm1"]
+
+                            # SQLite 저장
+                            self.logger.save_measurement(
+                                measured_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
+                                pm10=pm10,
+                                pm25=pm25,
+                                pm1=pm1,
+                                status="NORMAL"
+                            )
+                            
+                            for key, val in zip(["pm10", "pm25", "pm1"], (pm10, pm25, pm1)):
+                                self.minute_data_buffer[key].append(val)
+                                self.data_buffer[key].append(val)
+                                if len(self.data_buffer[key]) > Config.SMOOTHING_WINDOW:
+                                    self.data_buffer[key].pop(0)
+
+                        if time.time() - last_ui_update_time >= 1.0:
+                            last_ui_update_time = time.time()
+                            avgs = [
+                                int(sum(self.data_buffer[k]) / len(self.data_buffer[k]))
+                                for k in ["pm10", "pm25", "pm1"]
+                            ]
+                            self.data_signal.emit(self.port_name, *avgs)
 
     # --------------------------------
     # SQLite 원본 측정 데이터 저장
@@ -632,9 +389,6 @@ class SerialThread(QThread):
 
                             self.logger.save_measurement(
                                 measured_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f"),
-                                raw_pm10=raw["pm10"],
-                                raw_pm25=raw["pm25"],
-                                raw_pm1=raw["pm1"],
                                 pm10=pm10,
                                 pm25=pm25,
                                 pm1=pm1,
