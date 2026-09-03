@@ -583,6 +583,8 @@ class SerialThread(QThread):
             self.save_current_minute_average(self.current_minute_bucket)
         except Exception as e:
             self.logger.write_error(f"Thread 종료 시 마지막 데이터 저장 오류: {e}")
+    def update_calibration(self, new_calib_params):
+        self.calib_params = new_calib_params
 
 
 class DustLevelWidget(QWidget):
@@ -796,6 +798,79 @@ class PortSelectionDialog(QDialog):
             return
         self.accept()
 
+class CalibrationDialog(QDialog):
+    def __init__(self, current_calib_dict, parent=None):
+        super().__init__(parent)
+        self.calib_dict = current_calib_dict.copy()
+        self.initUI()
+
+    def initUI(self):
+        self.setWindowTitle("센서 보정값 설정")
+        self.resize(400, 300)
+        self.setStyleSheet("background-color: white;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        title_label = QLabel("센서별 PM10, PM2.5, PM1.0 보정 계수 설정")
+        title_label.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
+        layout.addWidget(title_label)
+
+        self.inputs = {}
+        
+        for i in range(Config.MAX_SENSORS):
+            group = QGroupBox(f"센서 {i + 1}")
+            group.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
+            g_layout = QHBoxLayout(group)
+            
+            curr = self.calib_dict.get(i, {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)})
+            scales = curr["scale"]
+            offsets = curr["offset"]
+
+            # 입력 필드 (PM10, PM2.5, PM1 순서 등 필요에 맞게 구성)
+            # 간소화를 위해 텍스트 박스나 스핀박스를 배치할 수 있습니다.
+            # 여기서는 간단히 입력을 받을 수 있는 QLineEdit 활용 예시
+            self.inputs[i] = {
+                "scale_10": QLineEdit(str(scales[0])),
+                "offset_10": QLineEdit(str(offsets[0])),
+                "scale_25": QLineEdit(str(scales[1])),
+                "offset_25": QLineEdit(str(offsets[1])),
+            }
+            
+            g_layout.addWidget(QLabel("PM10 Scale:"))
+            g_layout.addWidget(self.inputs[i]["scale_10"])
+            g_layout.addWidget(QLabel("Offset:"))
+            g_layout.addWidget(self.inputs[i]["offset_10"])
+            
+            layout.addWidget(group)
+
+        save_btn = QPushButton("적용 및 저장")
+        save_btn.setFixedHeight(35)
+        save_btn.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
+        save_btn.setStyleSheet("background-color: #28A745; color: white; border-radius: 4px;")
+        save_btn.clicked.connect(self.save_calib)
+        layout.addWidget(save_btn)
+
+    def save_calib(self):
+        try:
+            for i in range(Config.MAX_SENSORS):
+                s10 = float(self.inputs[i]["scale_10"].text())
+                o10 = float(self.inputs[i]["offset_10"].text())
+                s25 = float(self.inputs[i]["scale_25"].text())
+                o25 = float(self.inputs[i]["offset_25"].text())
+                
+                # 기존 설정 딕셔너리 갱신 (PM1은 예시상 기존 값 유지 혹은 확장 가능)
+                curr_scale = self.calib_dict.get(i, {}).get("scale", (1.0, 1.0, 1.0))
+                curr_offset = self.calib_dict.get(i, {}).get("offset", (0.0, 0.0, 0.0))
+                
+                self.calib_dict[i] = {
+                    "scale": (s10, s25, curr_scale[2]),
+                    "offset": (o10, o25, curr_offset[2])
+                }
+            self.accept()
+        except ValueError:
+            QMessageBox.warning(self, "오류", "올바른 숫자 형식(실수)을 입력해주세요.")
 
 class DustMonitorApp(QMainWindow):
     def __init__(self, slot_mapping):
@@ -811,18 +886,49 @@ class DustMonitorApp(QMainWindow):
         self.setWindowTitle("다중 미세먼지 모니터링 시스템")
         self.setStyleSheet("QMainWindow { background-color: white; }")
         self.setMinimumSize(400, 150)
+        # 전체 메인 레이아웃을 담을 위젯
+        central_widget = QWidget()
+        main_layout = QVBoxLayout(central_widget)
 
+        # 상단 제어 버튼 레이아웃
+        top_control_layout = QHBoxLayout()
+        self.calib_btn = QPushButton("센서 보정 설정")
+        self.calib_btn.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
+        self.calib_btn.setFixedHeight(30)
+        self.calib_btn.clicked.connect(self.open_calibration_dialog)
+        top_control_layout.addWidget(self.calib_btn)
+        top_control_layout.addStretch(1)
+        
+        main_layout.addLayout(top_control_layout)
+
+        # 스크롤 영역 설정
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.setCentralWidget(scroll)
-
         scroll_content = QWidget()
         scroll.setWidget(scroll_content)
-
+        
         self.scroll_layout = QVBoxLayout(scroll_content)
         self.scroll_layout.setContentsMargins(15, 15, 15, 15)
         self.scroll_layout.setSpacing(15)
         self.scroll_layout.addStretch(1)
+        
+        main_layout.addWidget(scroll)
+        self.setCentralWidget(central_widget)
+
+    def open_calibration_dialog(self):
+        # 현재 Config에 있는 보정값을 다이얼로그에 전달
+        dialog = CalibrationDialog(Config.SENSOR_CALIBRATION, self)
+        if dialog.exec_() == QDialog.Accepted:
+            # Config 전역 설정 갱신
+            Config.SENSOR_CALIBRATION = dialog.calib_dict
+            
+            # 현재 실행 중인 각 스레드에도 변경된 보정값 즉시 반영
+            for thread in self.threads:
+                idx = thread.sensor_index
+                if idx in Config.SENSOR_CALIBRATION:
+                    thread.update_calibration(Config.SENSOR_CALIBRATION[idx])
+            
+            QMessageBox.information(self, "성공", "보정값이 성공적으로 반영되었습니다.")
 
     def start_monitoring(self):
         for sensor_index, port_name in self.slot_mapping.items():
