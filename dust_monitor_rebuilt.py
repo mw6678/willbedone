@@ -195,32 +195,36 @@ class SensorLogger:
 
     def export_excel(self, date_str=None):
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                if date_str:
-                    rows = conn.execute("""
-                        SELECT measured_at, port, pm10, pm25, pm1, status
-                        FROM measurements WHERE sensor_index = ? AND measured_at LIKE ? ORDER BY measured_at
-                    """, (self.sensor_index, f"{date_str}%")).fetchall()
-                else:
-                    rows = conn.execute("""
-                        SELECT measured_at, port, pm10, pm25, pm1, status
-                        FROM measurements WHERE sensor_index = ? ORDER BY measured_at
-                    """, (self.sensor_index,)).fetchall()
+            # date_str이 주어지지 않았다면 오늘 날짜(YYYY-MM-DD)를 기본으로 사용
+            if not date_str:
+                date_str = datetime.now().strftime("%Y-%m-%d")
 
+            with sqlite3.connect(self.db_path) as conn:
+                # 특정 날짜(date_str)에 해당하는 데이터만 조회
+                rows = conn.execute("""
+                    SELECT measured_at, port, pm10, pm25, pm1, status
+                    FROM measurements 
+                    WHERE sensor_index = ? AND measured_at LIKE ? 
+                    ORDER BY measured_at
+                """, (self.sensor_index, f"{date_str}%")).fetchall()
+
+            # 해당 날짜에 데이터가 없으면 파일 생성 안 함
             if not rows:
                 return False
 
-            filename = f"Dust_log_Sensor{self.sensor_index + 1}.xlsx"
+            # 파일명에 날짜 포함 (예: Dust_log_2026-06-07_Sensor1.xlsx)
+            filename = f"Dust_log_{date_str}_Sensor{self.sensor_index + 1}.xlsx"
             file_path = os.path.join(self.excel_dir, filename)
 
             wb = Workbook()
             ws = wb.active
-            ws.title = "측정 데이터"
+            ws.title = f"{date_str} 측정 데이터"
 
             headers = ["측정일시", "포트", "PM10", "PM2.5", "PM1.0", "상태"]
             ws.append(headers)
             ws.row_dimensions[1].height = 25
 
+            # 스타일 정의 
             thin_border = Border(
                 left=Side(style='thin', color='D3D3D3'), right=Side(style='thin', color='D3D3D3'),
                 top=Side(style='thin', color='D3D3D3'), bottom=Side(style='thin', color='D3D3D3')
