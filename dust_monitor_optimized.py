@@ -806,71 +806,96 @@ class CalibrationDialog(QDialog):
 
     def initUI(self):
         self.setWindowTitle("센서 보정값 설정")
-        self.resize(400, 300)
+        self.resize(500, 500)
         self.setStyleSheet("background-color: white;")
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(10)
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(15)
 
+        # 안내 및 계산 공식 설명
         title_label = QLabel("센서별 PM10, PM2.5, PM1.0 보정 계수 설정")
         title_label.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
-        layout.addWidget(title_label)
+        main_layout.addWidget(title_label)
+
+        formula_label = QLabel("📌 계산 공식: 결과 값 = (원본값 + Offset) × Scale")
+        formula_label.setFont(QFont("Malgun Gothic", 9))
+        formula_label.setStyleSheet("color: #0056b3; background-color: #e7f1ff; padding: 6px; border-radius: 4px;")
+        main_layout.addWidget(formula_label)
+
+        # 스크롤 영역 생성 (센서가 많아지면 창이 넘칠 수 있으므로 스크롤 추가)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+        scroll_layout.setSpacing(10)
 
         self.inputs = {}
-        
+
         for i in range(Config.MAX_SENSORS):
             group = QGroupBox(f"센서 {i + 1}")
             group.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
-            g_layout = QHBoxLayout(group)
-            
-            curr = self.calib_dict.get(i, {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)})
-            scales = curr["scale"]
-            offsets = curr["offset"]
+            g_layout = QVBoxLayout(group)
+            g_layout.setSpacing(6)
 
-            # 입력 필드 (PM10, PM2.5, PM1 순서 등 필요에 맞게 구성)
-            # 간소화를 위해 텍스트 박스나 스핀박스를 배치할 수 있습니다.
-            # 여기서는 간단히 입력을 받을 수 있는 QLineEdit 활용 예시
+            curr = self.calib_dict.get(i, {
+                "scale": (1.0, 1.0, 1.0), 
+                "offset": (0.0, 0.0, 0.0)
+            })
+            scales = curr["scale"]   # (scale_pm10, scale_pm25, scale_pm1)
+            offsets = curr["offset"] # (offset_pm10, offset_pm25, offset_pm1)
+
             self.inputs[i] = {
-                "scale_10": QLineEdit(str(scales[0])),
-                "offset_10": QLineEdit(str(offsets[0])),
-                "scale_25": QLineEdit(str(scales[1])),
-                "offset_25": QLineEdit(str(offsets[1])),
+                "s_10": QLineEdit(str(scales[0])), "o_10": QLineEdit(str(offsets[0])),
+                "s_25": QLineEdit(str(scales[1])), "o_25": QLineEdit(str(offsets[1])),
+                "s_1":  QLineEdit(str(scales[2])), "o_1":  QLineEdit(str(offsets[2])),
             }
-            
-            g_layout.addWidget(QLabel("PM10 Scale:"))
-            g_layout.addWidget(self.inputs[i]["scale_10"])
-            g_layout.addWidget(QLabel("Offset:"))
-            g_layout.addWidget(self.inputs[i]["offset_10"])
-            
-            layout.addWidget(group)
+
+            # PM10, PM2.5, PM1.0 입력을 위한 가로 배치 레이아웃들
+            for target_name, key_s, key_o in [("PM10", "s_10", "o_10"), ("PM2.5", "s_25", "o_25"), ("PM1.0", "s_1", "o_1")]:
+                row_layout = QHBoxLayout()
+                lbl = QLabel(f"• {target_name}")
+                lbl.setFixedWidth(50)
+                lbl.setFont(QFont("Malgun Gothic", 9))
+                
+                row_layout.addWidget(lbl)
+                row_layout.addWidget(QLabel("Scale:"))
+                row_layout.addWidget(self.inputs[i][key_s])
+                row_layout.addWidget(QLabel("Offset:"))
+                row_layout.addWidget(self.inputs[i][key_o])
+                g_layout.addLayout(row_layout)
+
+            scroll_layout.addWidget(group)
+
+        scroll.setWidget(scroll_content)
+        main_layout.addWidget(scroll)
 
         save_btn = QPushButton("적용 및 저장")
         save_btn.setFixedHeight(35)
         save_btn.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
         save_btn.setStyleSheet("background-color: #28A745; color: white; border-radius: 4px;")
         save_btn.clicked.connect(self.save_calib)
-        layout.addWidget(save_btn)
+        main_layout.addWidget(save_btn)
 
     def save_calib(self):
         try:
             for i in range(Config.MAX_SENSORS):
-                s10 = float(self.inputs[i]["scale_10"].text())
-                o10 = float(self.inputs[i]["offset_10"].text())
-                s25 = float(self.inputs[i]["scale_25"].text())
-                o25 = float(self.inputs[i]["offset_25"].text())
-                
-                # 기존 설정 딕셔너리 갱신 (PM1은 예시상 기존 값 유지 혹은 확장 가능)
-                curr_scale = self.calib_dict.get(i, {}).get("scale", (1.0, 1.0, 1.0))
-                curr_offset = self.calib_dict.get(i, {}).get("offset", (0.0, 0.0, 0.0))
-                
+                # 입력된 값들을 실수(float)로 변환
+                s10 = float(self.inputs[i]["s_10"].text())
+                o10 = float(self.inputs[i]["o_10"].text())
+                s25 = float(self.inputs[i]["s_25"].text())
+                o25 = float(self.inputs[i]["o_25"].text())
+                s1  = float(self.inputs[i]["s_1"].text())
+                o1  = float(self.inputs[i]["o_1"].text())
+
+                # 딕셔너리에 튜플 형태로 저장 (PM10, PM2.5, PM1.0 순서)
                 self.calib_dict[i] = {
-                    "scale": (s10, s25, curr_scale[2]),
-                    "offset": (o10, o25, curr_offset[2])
+                    "scale": (s10, s25, s1),
+                    "offset": (o10, o25, o1)
                 }
             self.accept()
         except ValueError:
-            QMessageBox.warning(self, "오류", "올바른 숫자 형식(실수)을 입력해주세요.")
+            QMessageBox.warning(self, "오류", "모든 입력값에는 올바른 숫자(실수)를 입력해주세요.")
 
 class DustMonitorApp(QMainWindow):
     def __init__(self, slot_mapping):
