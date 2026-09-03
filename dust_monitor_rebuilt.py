@@ -16,6 +16,9 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -118,28 +121,170 @@ class DustParser:
 # 3. 로깅 및 파일 처리 (Sensor Logger)
 # ==========================================
 class SensorLogger:
-    _cleanup_done = False  # 클래스 변수: 앱 전체에서 한 번만 정리
-
     def __init__(self, port_name, sensor_index):
         self.port_name = port_name
         self.sensor_index = sensor_index
         
         self.log_dir = os.path.join(BASE_DIR, "Logs")
-        self.csv_dir = os.path.join(BASE_DIR, "CSV_Logs")
+        self.excel_dir = os.path.join(BASE_DIR, "Excel_Logs") # CSV 대신 엑셀 폴더
         self.db_dir = os.path.join(BASE_DIR, "Data")
         
         os.makedirs(self.log_dir, exist_ok=True)
-        os.makedirs(self.csv_dir, exist_ok=True)
+        os.makedirs(self.excel_dir, exist_ok=True)
         os.makedirs(self.db_dir, exist_ok=True)
 
-        self.db_path = os.path.join(
-            self.db_dir, "dust_measurement.db")
+        self.db_path = os.path.join(self.db_dir, "dust_measurement.db")
+        # ⚠️ init_database()와 cleanup_old_logs()는 여기서 호출하지 않고 외부(메인)로 뺍니다!
 
-        self.init_database()
+    # [클래스 외부 혹은 전역 함수로 분리할 수도 있는 초기화/정리 함수들]
+    @staticmethod
+    def init_global_database(db_path):
+        """앱 시작 시 전체 단 한 번만 호출하여 DB 초기화 및 최적화"""
+        try:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS measurements (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        measured_at TEXT NOT NULL,
+                        sensor_index INTEGER NOT NULL,
+                        port TEXT NOT NULL,
+                        raw_pm10 REAL,
+                        raw_pm25 REAL,
+                        raw_pm1 REAL,
+                        pm10 REAL,
+                        pm25 REAL,
+                        pm1 REAL,
+                        status TEXT DEFAULT 'NORMAL'
+                    )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_time ON measurements(measured_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_sensor ON measurements(sensor_index)")
+                conn.commit()
+        except Exception as e:
+            print(f"Global SQLite 초기화 오류: {e}")
 
-        if not SensorLogger._cleanup_done:
-            self.cleanup_old_logs()
-            SensorLogger._cleanup_done = True
+    @staticmethod
+    def cleanup_old_logs_global():
+        """앱 시작 시 오래된 로그 파일 정리"""
+        threshold_time = time.time() - (Config.LOG_RETENTION_DAYS * 24 * 60 * 60)
+        for target_dir in [os.path.join(BASE_DIR, "Logs"), os.path.join(BASE_DIR, "Excel_Logs")]:
+            if not os.path.exists(target_dir):
+                continue
+            for filename in os.listdir(target_dir):
+                file_path = os.path.join(target_dir, filename)
+                if os.path.isfile(file_path):
+                    try:
+                        if os.path.getmtime(file_path) < threshold_time:
+                            os.remove(file_path)
+                    except Exception:
+                        pass
+
+    def write_error(self, message):
+        log_file = os.path.join(self.log_dir, f"error_log_Sensor{self.sensor_index + 1}.txt")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with open(log_file, "a", encoding="utf-8-sig") as f:
+                f.write(f"{timestamp} | 포트: {self.port_name} | {message}\n")
+        except Exception:
+            pass
+
+    def save_measurement(self, measured_at, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status="NORMAL"):
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT INTO measurements (
+                        measured_at, sensor_index, port,
+                        raw_pm10, raw_pm25, raw_pm1,
+                        pm10, pm25, pm1, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (measured_at, self.sensor_index, self.port_name, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status))
+                conn.commit()
+            return True
+        except Exception as e:
+            self.write_error(f"SQLite 측정 데이터 저장 오류: {e}")
+            return False
+
+    def export_excel(self, date_str=None):
+       
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if date_str:
+                    rows = conn.execute("""
+                        SELECT measured_at, port, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status
+                        FROM measurements WHERE sensor_index = ? AND measured_at LIKE ? ORDER BY measured_at
+                    """, (self.sensor_index, f"{date_str}%")).fetchall()
+                else:
+                    rows = conn.execute("""
+                        SELECT measured_at, port, raw_pm10, raw_pm25, raw_pm1, pm10, pm25, pm1, status
+                        FROM measurements WHERE sensor_index = ? ORDER BY measured_at
+                    """, (self.sensor_index,)).fetchall()
+
+            if not rows:
+                return False
+
+            filename = f"Dust_log_Sensor{self.sensor_index + 1}.xlsx"
+            file_path = os.path.join(self.excel_dir, filename)
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "측정 데이터"
+
+            headers = ["측정일시", "포트", "Raw_PM10", "Raw_PM2.5", "Raw_PM1.0", "PM10", "PM2.5", "PM1.0", "상태"]
+            ws.append(headers)
+            ws.row_dimensions[1].height = 25
+
+            # 스타일 정의
+            thin_border = Border(
+                left=Side(style='thin', color='D3D3D3'), right=Side(style='thin', color='D3D3D3'),
+                top=Side(style='thin', color='D3D3D3'), bottom=Side(style='thin', color='D3D3D3')
+            )
+            header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
+            header_font = Font(name="Malgun Gothic", size=10, bold=True, color="FFFFFF")
+            data_font = Font(name="Malgun Gothic", size=9)
+            center_align = Alignment(horizontal="center", vertical="center")
+            right_align = Alignment(horizontal="right", vertical="center")
+
+            for col_num, header in enumerate(headers, 1):
+                cell = ws.cell(row=1, column=col_num)
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = center_align
+                cell.border = thin_border
+
+            for row_data in rows:
+                ws.append(list(row_data))
+                current_row = ws.max_row
+                ws.row_dimensions[current_row].height = 18
+
+                for col_num, val in enumerate(row_data, 1):
+                    cell = ws.cell(row=current_row, column=col_num)
+                    cell.font = data_font
+                    cell.border = thin_border
+
+                    # 정렬 및 포맷팅
+                    if col_num in [1, 2, 9]:
+                        cell.alignment = center_align
+                    else:
+                        cell.alignment = right_align
+                        if isinstance(val, (int, float)):
+                            cell.number_format = '#,##0'
+
+            # 열 너비 자동 조절
+            for col in ws.columns:
+                max_len = 0
+                col_letter = get_column_letter(col[0].column)
+                for cell in col:
+                    val_str = str(cell.value or '')
+                    max_len = max(max_len, len(val_str.encode('utf-8')) if cell.row == 1 else len(val_str))
+                ws.column_dimensions[col_letter].width = max(max_len + 4, 12)
+
+            wb.save(file_path)
+            return True
+
+        except Exception as e:
+            self.write_error(f"Excel Export 오류: {e}")
+            return False
             
 # ==========================================
 # SQLite 초기화
@@ -796,9 +941,11 @@ class DustMonitorApp(QMainWindow):
         for thread in self.threads:
             thread.wait(2000)
     
-        # 종료할 때 각 센서별로 CSV 내보내기 실행
+        # [변경] 종료할 때 각 센서별로 엑셀 파일 내보내기 실행
         for thread in self.threads:
-            thread.logger.export_csv()
+            thread.logger.export_excel()
+            
+        event.accept()
             
         event.accept()
 
@@ -815,6 +962,12 @@ class DustMonitorApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # [추가] 앱 시작 시 전역 DB 초기화 및 오래된 로그 정리 (중복 실행 방지)
+    db_path = os.path.join(BASE_DIR, "Data", "dust_measurement.db")
+    SensorLogger.init_global_database(db_path)
+    SensorLogger.cleanup_old_logs_global()
+
     setup_dialog = PortSelectionDialog()
     if setup_dialog.exec_() == QDialog.Accepted:
         window = DustMonitorApp(setup_dialog.selected_ports)
