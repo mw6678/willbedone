@@ -71,11 +71,11 @@ class Config:
 
     DEFAULT_SENSOR_CALIBRATION = {
         0: {
-            "scale": (1.0, 2.0, 1.0),
-            "offset": (0.0, 1.0, 0.0),
+            "scale": (1.0, 1.0, 1.0),
+            "offset": (0.0, 0.0, 0.0),
         },
         1: {
-            "scale": (1.0, 3.0, 1.0),
+            "scale": (1.0, 1.0, 1.0),
             "offset": (0.0, 1.0, 0.0),
         },
         2: {

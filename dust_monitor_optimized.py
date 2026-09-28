@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QFrame, QPushButton, QDialog, QMessageBox, QScrollArea,
-    QGroupBox, QComboBox,
+    QGroupBox, QComboBox, QLineEdit
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QPoint
 from PyQt5.QtGui import QFont
@@ -35,7 +35,7 @@ class Config:
     NO_DATA_TIMEOUT = 30.0
     RECONNECT_DELAY_MS = 3000
     LOG_RETENTION_DAYS = 30
-    THREAD_WAIT_MS = 5000
+    THREAD_WAIT_MS = 3000
 
     SENSOR_CALIBRATION = {
         0: {"scale": (1.0, 2.0, 1.0), "offset": (0.0, 1.0, 0.0)},
@@ -86,16 +86,14 @@ class DustParser:
 
             scales = calib_params.get("scale", (1.0, 1.0, 1.0))
             offsets = calib_params.get("offset", (0.0, 0.0, 0.0))
-            scale_pm10, scale_pm25, scale_pm1 = scales
-            offset_pm10, offset_pm25, offset_pm1 = offsets
 
             raw_pm1 = float(parts[0])
             raw_pm25 = float(parts[1])
             raw_pm10 = float(parts[2])
 
-            pm10 = max(0, int(round((raw_pm10 + offset_pm10) * scale_pm10)))
-            pm25 = max(0, int(round((raw_pm25 + offset_pm25) * scale_pm25)))
-            pm1 = max(0, int(round((raw_pm1 + offset_pm1) * scale_pm1)))
+            pm10 = max(0, int(round((raw_pm10 * scales[0]) + offsets[0])))
+            pm25 = max(0, int(round((raw_pm25 * scales[1]) + offsets[1])))
+            pm1 = max(0, int(round((raw_pm1 * scales[2]) + offsets[2])))
 
             if pm1 > 1000 or pm25 > 1000 or pm10 > 2000:
                 return "OUT_OF_RANGE"
@@ -183,20 +181,30 @@ class DatabaseManager:
             except Exception as e:
                 print(f"DB Worker 루프 오류: {e}")
 
-    def execute_sync(self, func, *args):
+    def execute_async(self, func, *args):
+        """비동기 방식으로 DB 작업 등록 (호출 스레드 블로킹 방지)"""
+        try:
+            self.queue.put_nowait((func, args, None, None))
+            return True
+        except queue.Full:
+            print("DB 작업 큐가 가득 찼습니다.")
+            return False
+
+    def execute_sync(self, func, *args, timeout=5.0):
+        """동기 방식으로 작업 실행 결과를 대기"""
         future_event = threading.Event()
         result_holder = {}
         try:
-            # 큐가 가득 찼을 때 블로킹 타임아웃을 주어 프로그램 멈춤 방지
             self.queue.put((func, args, future_event, result_holder), timeout=2.0)
         except queue.Full:
-            print("DB 작업 큐가 가득 찼습니다. 일부 로그 저장이 지연될 수 있습니다.")
-            return False
+            print("DB 작업 큐가 가득 찼습니다.")
+            return None
 
-        future_event.wait(timeout=Config.THREAD_WAIT_MS / 2000.0)
-        if 'error' in result_holder:
-            return False
-        return result_holder.get('result', True)
+        if future_event.wait(timeout=timeout):
+            if 'error' in result_holder:
+                return None
+            return result_holder.get('result')
+        return None
 
     def stop(self):
         self.running = False
@@ -287,13 +295,8 @@ class SensorLogger:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, data)
-            return True
 
-        success = self.db_manager.execute_sync(_insert, measurements)
-        if not success:
-            self.write_error("SQLite 일괄 저장 오류")
-            return False
-        return True
+        return self.db_manager.execute_async(_insert, measurements)
 
     def export_excel(self, date_str=None):
         try:
@@ -304,7 +307,7 @@ class SensorLogger:
             next_date = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
             end_datetime = f"{next_date} 00:00:00"
 
-            def _fetch_chunks(conn):
+            def _fetch_rows(conn):
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT measured_at, port, pm10, pm25, pm1, status
@@ -312,11 +315,11 @@ class SensorLogger:
                     WHERE sensor_index = ? AND measured_at >= ? AND measured_at < ?
                     ORDER BY measured_at
                 """, (self.sensor_index, start_datetime, end_datetime))
-                while True:
-                    rows = cursor.fetchmany(1000)
-                    if not rows:
-                        break
-                    yield rows
+                return cursor.fetchall()
+
+            rows = self.db_manager.execute_sync(_fetch_rows)
+            if not rows:
+                return False
 
             filename = f"Dust_log_{date_str}_Sensor{self.sensor_index + 1}.xlsx"
             file_path = os.path.join(self.excel_dir, filename)
@@ -346,28 +349,21 @@ class SensorLogger:
                 cell.alignment = center_align
                 cell.border = thin_border
 
-            has_data = False
-            with sqlite3.connect(self.db_path, timeout=10.0) as conn:
-                for chunk in _fetch_chunks(conn):
-                    has_data = True
-                    for row_data in chunk:
-                        ws.append(list(row_data))
-                        current_row = ws.max_row
-                        ws.row_dimensions[current_row].height = 18
+            for row_data in rows:
+                ws.append(list(row_data))
+                current_row = ws.max_row
+                ws.row_dimensions[current_row].height = 18
 
-                        for col_num, value in enumerate(row_data, 1):
-                            cell = ws.cell(row=current_row, column=col_num)
-                            cell.font = data_font
-                            cell.border = thin_border
-                            if col_num in [1, 2, 6]:
-                                cell.alignment = center_align
-                            else:
-                                cell.alignment = right_align
-                                if isinstance(value, (int, float)):
-                                    cell.number_format = "#,##0"
-
-            if not has_data:
-                return False
+                for col_num, value in enumerate(row_data, 1):
+                    cell = ws.cell(row=current_row, column=col_num)
+                    cell.font = data_font
+                    cell.border = thin_border
+                    if col_num in [1, 2, 6]:
+                        cell.alignment = center_align
+                    else:
+                        cell.alignment = right_align
+                        if isinstance(value, (int, float)):
+                            cell.number_format = "#,##0"
 
             for col in ws.columns:
                 max_len = 0
@@ -382,6 +378,31 @@ class SensorLogger:
             return True
         except Exception as e:
             self.write_error(f"Excel Export 오류: {e}")
+            return False
+
+    def export_all_dates_excel(self):
+        try:
+            def _get_dates(conn):
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT DISTINCT SUBSTR(measured_at, 1, 10) 
+                    FROM measurements 
+                    WHERE sensor_index = ?
+                    ORDER BY measured_at
+                """, (self.sensor_index,))
+                return [row[0] for row in cursor.fetchall()]
+
+            dates = self.db_manager.execute_sync(_get_dates)
+            if not dates or not isinstance(dates, list):
+                return False
+
+            success_any = False
+            for date_str in dates:
+                if self.export_excel(date_str):
+                    success_any = True
+            return success_any
+        except Exception as e:
+            self.write_error(f"전체 날짜 엑셀 내보내기 오류: {e}")
             return False
 
 
@@ -468,13 +489,9 @@ class SerialThread(QThread):
         if new_bucket == self.current_minute_bucket:
             return
 
-        # 이전 분에 쌓인 데이터가 있다면 저장 시도
         if self.minute_count > 0:
-            save_success = self.save_current_minute_average(self.current_minute_bucket)
-            if not save_success:
-                self.logger.write_error("이전 분 데이터 저장 실패 - 재시도 필요")
-        
-        # 분이 바뀔 때마다 버킷 갱신 및 카운터 초기화
+            self.save_current_minute_average(self.current_minute_bucket)
+
         self.current_minute_bucket = new_bucket
         self.clear_minute_buffers()
 
@@ -583,6 +600,7 @@ class SerialThread(QThread):
             self.save_current_minute_average(self.current_minute_bucket)
         except Exception as e:
             self.logger.write_error(f"Thread 종료 시 마지막 데이터 저장 오류: {e}")
+
     def update_calibration(self, new_calib_params):
         self.calib_params = new_calib_params
 
@@ -798,6 +816,7 @@ class PortSelectionDialog(QDialog):
             return
         self.accept()
 
+
 class CalibrationDialog(QDialog):
     def __init__(self, current_calib_dict, parent=None):
         super().__init__(parent)
@@ -813,17 +832,15 @@ class CalibrationDialog(QDialog):
         main_layout.setContentsMargins(20, 20, 20, 20)
         main_layout.setSpacing(15)
 
-        # 안내 및 계산 공식 설명
         title_label = QLabel("센서별 PM10, PM2.5, PM1.0 보정 계수 설정")
         title_label.setFont(QFont("Malgun Gothic", 10, QFont.Bold))
         main_layout.addWidget(title_label)
 
-        formula_label = QLabel("📌 계산 공식: 결과 값 = (원본값 + Offset) × Scale")
+        formula_label = QLabel("📌 계산 공식: 결과 값 = (원본값 × Scale) + Offset")
         formula_label.setFont(QFont("Malgun Gothic", 9))
         formula_label.setStyleSheet("color: #0056b3; background-color: #e7f1ff; padding: 6px; border-radius: 4px;")
         main_layout.addWidget(formula_label)
 
-        # 스크롤 영역 생성 (센서가 많아지면 창이 넘칠 수 있으므로 스크롤 추가)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll_content = QWidget()
@@ -839,11 +856,11 @@ class CalibrationDialog(QDialog):
             g_layout.setSpacing(6)
 
             curr = self.calib_dict.get(i, {
-                "scale": (1.0, 1.0, 1.0), 
+                "scale": (1.0, 1.0, 1.0),
                 "offset": (0.0, 0.0, 0.0)
             })
-            scales = curr["scale"]   # (scale_pm10, scale_pm25, scale_pm1)
-            offsets = curr["offset"] # (offset_pm10, offset_pm25, offset_pm1)
+            scales = curr["scale"]
+            offsets = curr["offset"]
 
             self.inputs[i] = {
                 "s_10": QLineEdit(str(scales[0])), "o_10": QLineEdit(str(offsets[0])),
@@ -851,13 +868,12 @@ class CalibrationDialog(QDialog):
                 "s_1":  QLineEdit(str(scales[2])), "o_1":  QLineEdit(str(offsets[2])),
             }
 
-            # PM10, PM2.5, PM1.0 입력을 위한 가로 배치 레이아웃들
             for target_name, key_s, key_o in [("PM10", "s_10", "o_10"), ("PM2.5", "s_25", "o_25"), ("PM1.0", "s_1", "o_1")]:
                 row_layout = QHBoxLayout()
                 lbl = QLabel(f"• {target_name}")
                 lbl.setFixedWidth(50)
                 lbl.setFont(QFont("Malgun Gothic", 9))
-                
+
                 row_layout.addWidget(lbl)
                 row_layout.addWidget(QLabel("Scale:"))
                 row_layout.addWidget(self.inputs[i][key_s])
@@ -880,7 +896,6 @@ class CalibrationDialog(QDialog):
     def save_calib(self):
         try:
             for i in range(Config.MAX_SENSORS):
-                # 입력된 값들을 실수(float)로 변환
                 s10 = float(self.inputs[i]["s_10"].text())
                 o10 = float(self.inputs[i]["o_10"].text())
                 s25 = float(self.inputs[i]["s_25"].text())
@@ -888,7 +903,6 @@ class CalibrationDialog(QDialog):
                 s1  = float(self.inputs[i]["s_1"].text())
                 o1  = float(self.inputs[i]["o_1"].text())
 
-                # 딕셔너리에 튜플 형태로 저장 (PM10, PM2.5, PM1.0 순서)
                 self.calib_dict[i] = {
                     "scale": (s10, s25, s1),
                     "offset": (o10, o25, o1)
@@ -896,6 +910,7 @@ class CalibrationDialog(QDialog):
             self.accept()
         except ValueError:
             QMessageBox.warning(self, "오류", "모든 입력값에는 올바른 숫자(실수)를 입력해주세요.")
+
 
 class DustMonitorApp(QMainWindow):
     def __init__(self, slot_mapping):
@@ -911,49 +926,67 @@ class DustMonitorApp(QMainWindow):
         self.setWindowTitle("다중 미세먼지 모니터링 시스템")
         self.setStyleSheet("QMainWindow { background-color: white; }")
         self.setMinimumSize(400, 150)
-        # 전체 메인 레이아웃을 담을 위젯
+
         central_widget = QWidget()
         main_layout = QVBoxLayout(central_widget)
 
-        # 상단 제어 버튼 레이아웃
         top_control_layout = QHBoxLayout()
         self.calib_btn = QPushButton("센서 보정 설정")
         self.calib_btn.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
         self.calib_btn.setFixedHeight(30)
         self.calib_btn.clicked.connect(self.open_calibration_dialog)
         top_control_layout.addWidget(self.calib_btn)
+
+        self.export_btn = QPushButton("전체 엑셀 내보내기")
+        self.export_btn.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
+        self.export_btn.setFixedHeight(30)
+        self.export_btn.setStyleSheet("background-color: #17A2B8; color: white; border-radius: 4px;")
+        self.export_btn.clicked.connect(self.export_all_excel_manual)
+        top_control_layout.addWidget(self.export_btn)
+
         top_control_layout.addStretch(1)
-        
         main_layout.addLayout(top_control_layout)
 
-        # 스크롤 영역 설정
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll_content = QWidget()
         scroll.setWidget(scroll_content)
-        
+
         self.scroll_layout = QVBoxLayout(scroll_content)
         self.scroll_layout.setContentsMargins(15, 15, 15, 15)
         self.scroll_layout.setSpacing(15)
         self.scroll_layout.addStretch(1)
-        
+
         main_layout.addWidget(scroll)
         self.setCentralWidget(central_widget)
 
     def open_calibration_dialog(self):
-        # 현재 Config에 있는 보정값을 다이얼로그에 전달
         dialog = CalibrationDialog(Config.SENSOR_CALIBRATION, self)
         if dialog.exec_() == QDialog.Accepted:
-            # Config 전역 설정 갱신
             Config.SENSOR_CALIBRATION = dialog.calib_dict
-            
-            # 현재 실행 중인 각 스레드에도 변경된 보정값 즉시 반영
+
             for thread in self.threads:
                 idx = thread.sensor_index
                 if idx in Config.SENSOR_CALIBRATION:
                     thread.update_calibration(Config.SENSOR_CALIBRATION[idx])
-            
+
             QMessageBox.information(self, "성공", "보정값이 성공적으로 반영되었습니다.")
+
+    def export_all_excel_manual(self):
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            success = False
+            for thread in self.threads:
+                if thread.logger.export_all_dates_excel():
+                    success = True
+            QApplication.restoreOverrideCursor()
+            if success:
+                QMessageBox.information(self, "완료", "모든 날짜별 엑셀 파일 생성이 완료되었습니다.")
+            else:
+                QMessageBox.warning(self, "알림", "내보낼 데이터가 없습니다.")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "오류", f"엑셀 내보내기 중 오류 발생: {e}")
 
     def start_monitoring(self):
         for sensor_index, port_name in self.slot_mapping.items():
@@ -1000,29 +1033,25 @@ class DustMonitorApp(QMainWindow):
         widgets["pm1"].set_error_state(error_msg)
 
     def closeEvent(self, event):
+        # 1. 시리얼 스레드 중단 요청
         for thread in self.threads:
             if thread.isRunning():
                 thread.requestInterruption()
 
+        # 2. 스레드 종료 대기
         for thread in self.threads:
             if thread.isRunning():
-                if not thread.wait(Config.THREAD_WAIT_MS):
-                    thread.logger.write_error("프로그램 종료 시 Thread 종료 시간 초과")
+                thread.wait(Config.THREAD_WAIT_MS)
 
+        # 3. 마지막 분 데이터 비동기 저장 요청 및 금일 엑셀 추출
         for thread in self.threads:
             try:
-                if thread.isRunning():
-                    continue
                 thread.save_current_minute_average(thread.current_minute_bucket)
+                thread.logger.export_excel()  # 빠른 종료를 위해 금일 데이터만 엑셀로 추출
             except Exception as e:
-                thread.logger.write_error(f"종료 데이터 저장 오류: {e}")
+                thread.logger.write_error(f"종료 처리 오류: {e}")
 
-        for thread in self.threads:
-            try:
-                thread.logger.export_excel()
-            except Exception as e:
-                thread.logger.write_error(f"종료 시 Excel Export 오류: {e}")
-
+        # 4. DB 워커 스레드 안전하게 종료
         DatabaseManager(self.db_path).stop()
         event.accept()
 
