@@ -10,7 +10,7 @@ import math
 import serial
 import serial.tools.list_ports
 
-APP_VERSION = "4.1.0" # 개선된 버전
+APP_VERSION = "4.0.0"
 
 from collections import deque
 from datetime import datetime, timedelta
@@ -258,7 +258,7 @@ class DatabaseManager:
                     )
                 """)
 
-                # 버전이 다른 기존 DB를 안전하게 마이그레이션
+                # 버전이 다른 기존 DB를 안전하게 마이그레이션합니다.
                 existing_columns = {row[1] for row in conn.execute("PRAGMA table_info(measurements)").fetchall()}
                 required_columns = {
                     "raw_pm10": "REAL",
@@ -300,16 +300,7 @@ class DatabaseManager:
                     self.queue.task_done()
                     continue
 
-                # 5-tuple 언패킹 (수정 반영: expiry_time 추가)
-                func, args, future_event, result_holder, expiry_time = task
-                
-                # 타임아웃 지난 고스트 실행 방지 (수정 반영)
-                if expiry_time is not None and time.time() > expiry_time:
-                    if future_event is not None:
-                        future_event.set()
-                    self.queue.task_done()
-                    continue
-
+                func, args, future_event, result_holder = task
                 try:
                     result = func(conn, *args)
                     conn.commit()
@@ -324,13 +315,12 @@ class DatabaseManager:
                         result_holder["error"] = e
                     print(f"SQLite 작업 오류: {type(e).__name__}: {e}")
 
-                    # 치명적인 DB 연결 오류일 때만 conn을 닫고 초기화 (수정 반영)
-                    if isinstance(e, sqlite3.OperationalError):
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        conn = None
+                    # 연결 자체가 문제가 되었을 가능성에 대비해 다음 작업에서 재연결합니다.
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
                 finally:
                     if future_event is not None:
                         future_event.set()
@@ -358,8 +348,7 @@ class DatabaseManager:
         with self._stop_lock:
             if self._stopped or not self.running:
                 return False
-            # expiry_time을 None으로 전달
-            task = (func, args, None, None, None)
+            task = (func, args, None, None)
             try:
                 self.queue.put(task, timeout=Config.DB_QUEUE_PUT_TIMEOUT)
                 return True
@@ -370,15 +359,12 @@ class DatabaseManager:
     def execute_sync(self, func, *args, timeout=5.0):
         future_event = threading.Event()
         result_holder = {}
-        # 큐 삽입 시 만료 시간 계산하여 전달 (수정 반영)
-        expiry_time = time.time() + timeout
-        
         with self._stop_lock:
             if self._stopped or not self.running:
                 return None
             try:
                 self.queue.put(
-                    (func, args, future_event, result_holder, expiry_time),
+                    (func, args, future_event, result_holder),
                     timeout=Config.DB_QUEUE_PUT_TIMEOUT
                 )
             except queue.Full:
@@ -396,15 +382,16 @@ class DatabaseManager:
     def flush(self, timeout=10.0):
         done = threading.Event()
         result_holder = {}
-        def barrier(conn): return True
+
+        def barrier(conn):
+            return True
 
         with self._stop_lock:
             if self._stopped:
                 return False
             try:
-                # expiry_time을 None으로 전달
                 self.queue.put(
-                    (barrier, (), done, result_holder, None),
+                    (barrier, (), done, result_holder),
                     timeout=Config.DB_QUEUE_PUT_TIMEOUT
                 )
             except queue.Full:
@@ -527,6 +514,7 @@ class SensorLogger:
         ws = wb.active
         ws.title = f"{date_str} 측정 데이터"
 
+        # Raw 데이터도 엑셀에 출력되도록 헤더 추가
         headers = ["측정일시", "포트", "PM10", "PM2.5", "PM1.0", "Raw PM10", "Raw PM2.5", "Raw PM1.0", "상태"]
         ws.append(headers)
 
@@ -598,6 +586,7 @@ class SerialThread(QThread):
             "pm1": deque(maxlen=window_size)
         }
         
+        # 1분 평균 계산을 위한 데이터 버퍼(보정값과 로우 데이터 동시 저장)
         self.minute_sum = {"pm10": 0, "pm25": 0, "pm1": 0, "raw_pm10": 0.0, "raw_pm25": 0.0, "raw_pm1": 0.0}
         self.minute_count = 0
         self.current_minute_bucket = datetime.now().replace(second=0, microsecond=0)
@@ -645,6 +634,7 @@ class SerialThread(QThread):
             avg_pm25 = int(round(self.minute_sum["pm25"] / count))
             avg_pm1 = int(round(self.minute_sum["pm1"] / count))
             
+            # 원본(Raw) 평균 데이터
             avg_raw_pm10 = round(self.minute_sum["raw_pm10"] / count, 2)
             avg_raw_pm25 = round(self.minute_sum["raw_pm25"] / count, 2)
             avg_raw_pm1 = round(self.minute_sum["raw_pm1"] / count, 2)
@@ -725,6 +715,7 @@ class SerialThread(QThread):
                     elif parsed_values:
                         no_data_error_sent = False
                         for p in parsed_values:
+                            # 로우 데이터까지 모두 넘기기
                             self.add_measurement(p["pm10"], p["pm25"], p["pm1"], p["raw_pm10"], p["raw_pm25"], p["raw_pm1"])
                         
                         current_time = time.time()
@@ -767,6 +758,7 @@ class SerialThread(QThread):
             if any(x < 0 for x in scale):
                 return False
 
+            # 아직 DB에 저장되지 않은 현재 분 데이터가 있으면 먼저 동기 저장합니다.
             if self.minute_count > 0:
                 bucket = self.current_minute_bucket
                 if not self.save_current_minute_average(bucket, synchronous=True):
@@ -783,6 +775,7 @@ class SerialThread(QThread):
             return False
 
 
+# UI 코드 (DustLevelWidget, PortSelectionDialog, CalibrationDialog, ExcelExportWorker, DustMonitorApp, main) 
 # ============================================================
 # Dust Level Widget
 # ============================================================
@@ -925,6 +918,7 @@ class DustLevelWidget(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # 위젯이 화면에 출력되고 레이아웃 정렬이 완전히 완료된 후 화살표 위치 계산
         QTimer.singleShot(50, self.update_arrow_position)
 
     def resizeEvent(self, event):
@@ -1333,12 +1327,9 @@ class DustMonitorApp(QMainWindow):
         except Exception:
             pass
 
-    # 수정 반영: 엑셀 내보내기 실패 시 UI(QMessageBox)로 경고 표시
     def handle_auto_export_finished(self, success, message):
         if not success:
-            error_text = f"[자동 Excel 실패] {message}"
-            print(error_text)
-            QMessageBox.warning(self, "엑셀 자동 저장 실패", f"{error_text}\n(해당 엑셀 파일이 켜져 있는지 확인하세요.)")
+            print(f"[자동 Excel] {message}")
 
     def closeEvent(self, event):
         progress = QProgressDialog("프로그램을 안전하게 종료하는 중입니다...", None, 0, 0, self)
