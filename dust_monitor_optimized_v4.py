@@ -56,8 +56,8 @@ class Config:
     VACUUM_MIN_INTERVAL_DAYS = 7
 
     DEFAULT_SENSOR_CALIBRATION = {
-        0: {"scale": (1.0, 2.0, 1.0), "offset": (0.0, 1.0, 0.0)},
-        1: {"scale": (1.0, 3.0, 1.0), "offset": (0.0, 1.0, 0.0)},
+        0: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
+        1: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
         2: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
         3: {"scale": (1.0, 1.0, 1.0), "offset": (0.0, 0.0, 0.0)},
     }
@@ -514,8 +514,8 @@ class SensorLogger:
         ws = wb.active
         ws.title = f"{date_str} 측정 데이터"
 
-        # Raw 데이터도 엑셀에 출력되도록 헤더 추가
-        headers = ["측정일시", "포트", "PM10", "PM2.5", "PM1.0", "Raw PM10", "Raw PM2.5", "Raw PM1.0", "상태"]
+        # 1. 헤더에서 Raw 부분을 제외합니다.
+        headers = ["측정일시", "포트", "PM10", "PM2.5", "PM1.0", "상태"]
         ws.append(headers)
 
         thin_border = Border(left=Side(style="thin", color="D3D3D3"), right=Side(style="thin", color="D3D3D3"),
@@ -532,18 +532,26 @@ class SensorLogger:
             cell.border = thin_border
 
         for row_data in rows:
-            ws.append(list(row_data))
+            # 2. DB에서 가져온 데이터(row_data) 중 Raw 값을 제외하고 리스트를 만듭니다.
+            # 인덱스: 0(시간), 1(포트), 2(PM10), 3(PM25), 4(PM1), 8(상태)
+            filtered_row = [row_data[0], row_data[1], row_data[2], row_data[3], row_data[4], row_data[8]]
+            ws.append(filtered_row)
+            
             current_row = ws.max_row
-            for col_num, value in enumerate(row_data, 1):
+            for col_num, value in enumerate(filtered_row, 1):
                 cell = ws.cell(row=current_row, column=col_num)
                 cell.font = data_font
                 cell.border = thin_border
-                if col_num in (1, 2, 9): cell.alignment = Alignment(horizontal="center", vertical="center")
+                # 컬럼 번호 1(일시), 2(포트), 6(상태)는 가운데 정렬
+                if col_num in (1, 2, 6): 
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
                 else: 
                     cell.alignment = Alignment(horizontal="right", vertical="center")
-                    if isinstance(value, (int, float)): cell.number_format = "#,##0.0" if col_num > 5 else "#,##0"
+                    if isinstance(value, (int, float)): 
+                        cell.number_format = "#,##0"
 
-        for i, width in enumerate([19, 14, 10, 10, 10, 10, 10, 10, 12], 1):
+        # 3. 열 너비 설정도 남은 6개 컬럼에 맞게 수정합니다.
+        for i, width in enumerate([19, 14, 10, 10, 10, 12], 1):
             ws.column_dimensions[get_column_letter(i)].width = width
 
         try:
@@ -1206,7 +1214,15 @@ class DustMonitorApp(QMainWindow):
         self.calib_btn.setFixedHeight(30)
         self.calib_btn.clicked.connect(self.open_calibration_dialog)
 
+        # 🟢 추가된 "보정값 새로고침" 버튼
+        self.reload_calib_btn = QPushButton("🔄 외부 보정값 파일 새로고침")
+        self.reload_calib_btn.setFont(QFont("Malgun Gothic", 9, QFont.Bold))
+        self.reload_calib_btn.setFixedHeight(30)
+        self.reload_calib_btn.setStyleSheet("background-color: #17A2B8; color: white; border-radius: 4px; padding: 0 10px;")
+        self.reload_calib_btn.clicked.connect(self.reload_calibration_from_file)
+
         top_control_layout.addWidget(self.calib_btn)
+        top_control_layout.addWidget(self.reload_calib_btn) # 🟢 레이아웃에 추가
         top_control_layout.addStretch(1)
 
         main_layout.addLayout(top_control_layout)
@@ -1249,6 +1265,23 @@ class DustMonitorApp(QMainWindow):
                 )
             else:
                 QMessageBox.information(self, "성공", "보정값이 저장되고 현재 센서에 즉시 반영되었습니다.")
+
+    def reload_calibration_from_file(self):
+        """외부 스크립트(calibrate_pm25.py)가 수정한 보정값 파일을 실시간으로 다시 읽어와 적용합니다."""
+        Config.load_calibration()
+        
+        apply_failed = []
+        for thread in self.threads:
+            idx = thread.sensor_index
+            calib = Config.SENSOR_CALIBRATION.get(idx)
+            if calib is not None:
+                if not thread.update_calibration(calib):
+                    apply_failed.append(idx + 1)
+        
+        if apply_failed:
+            QMessageBox.warning(self, "경고", f"보정값은 읽어왔으나 일부 센서에 적용하지 못했습니다.\n센서: {apply_failed}")
+        else:
+            QMessageBox.information(self, "성공", "외부 파일(sensor_calibration.json)의 최신 보정값을 성공적으로 불러와 모든 센서에 적용했습니다.")
 
     def start_monitoring(self):
         for sensor_index, port_name in self.slot_mapping.items():
