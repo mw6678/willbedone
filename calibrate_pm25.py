@@ -3,9 +3,10 @@ import json
 import sqlite3
 import math
 import sys
+import re
 from datetime import datetime
 
-# 1. xls, xlsx, csv 모두 호환되도록 pandas 사용
+# pandas 사용
 try:
     import pandas as pd
 except ImportError:
@@ -18,15 +19,14 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "Data", "dust_measurement.db")
 CALIB_FILE = os.path.join(BASE_DIR, "Data", "sensor_calibration.json")
 
-# 2. 1시간(60분) 중 최소 필요 데이터 수를 45분으로 완화 (결측치 일부 허용)
 MIN_MINUTE_COUNT = 45 
 
-TIME_KEYWORDS = ["일시", "시간", "날짜", "측정일시", "DATE", "TIME"]
-REF_KEYWORDS = ["기준기", "기준값", "기준농도", "REFERENCE", "BAM", "GRIMM", "PM2.5", "PM25"]
+# KOTITI 키워드 포함
+REF_KEYWORDS = ["기준기", "기준값", "기준농도", "REFERENCE", "BAM", "GRIMM", "PM2.5", "PM25", "KOTITI"]
 
 def find_reference_file(base_dir):
     ignore_prefixes = ("~$", "Dust_log_")
-    valid_extensions = (".xlsx", ".csv", ".xls") # .xls 파일 포맷 추가
+    valid_extensions = (".xlsx", ".csv", ".xls")
     try:
         candidates = [f for f in os.listdir(base_dir) if any(f.lower().endswith(ext) for ext in valid_extensions) and not any(f.startswith(p) for p in ignore_prefixes) and os.path.isfile(os.path.join(base_dir, f))]
     except OSError: 
@@ -55,7 +55,6 @@ def get_sensor_hourly_averages(sensor_index=0):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # raw_pm25 원본값을 대상으로 1시간 평균값 계산
     query = """
         SELECT 
             strftime('%Y-%m-%d %H:00:00', measured_at) AS hour_bucket,
@@ -72,26 +71,21 @@ def get_sensor_hourly_averages(sensor_index=0):
     conn.close()
     return {row[0]: round(row[1], 2) for row in rows}
 
-def parse_datetime_value(val):
-    if pd.isna(val): 
-        return None
-    if isinstance(val, datetime): 
-        return val.strftime("%Y-%m-%d %H:00:00")
-        
-    val_str = str(val).strip()
-    formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y.%m.%d %H:%M:%S", "%Y.%m.%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"]
-    for fmt in formats:
-        try: 
-            return datetime.strptime(val_str[:16], fmt[:len(val_str[:16])]).strftime("%Y-%m-%d %H:00:00")
-        except ValueError: 
-            continue
-    return None
-
 def load_reference_file(file_path):
     ext = file_path.lower().split('.')[-1]
+    filename = os.path.basename(file_path)
+    
+    # 🟢 1. 파일 이름(예: 기준측정기 데이터_260929-260930.xls)에서 연도와 월 추출
+    # 추출 실패 시 현재 연/월 사용
+    file_year = datetime.now().year
+    file_month = datetime.now().month
+    match = re.search(r'(\d{2})(\d{2})\d{2}', filename)
+    if match:
+        file_year = 2000 + int(match.group(1)) # 26 -> 2026
+        file_month = int(match.group(2))       # 09 -> 9
+        
     try:
         if ext in ['xls', 'xlsx']:
-            # header=None 으로 전체를 읽은 뒤 파이썬에서 헤더 위치를 탐색
             df = pd.read_excel(file_path, header=None)
         elif ext == 'csv':
             df = pd.read_csv(file_path, header=None, encoding="utf-8-sig")
@@ -100,38 +94,62 @@ def load_reference_file(file_path):
     except Exception as e:
         raise ValueError(f"파일을 읽어오는 데 실패했습니다: {e}")
 
+    date_col_idx = None
     time_col_idx = None
     ref_col_idx = None
     header_row_idx = None
     
-    # 상위 15개 행을 스캔하여 '시간', '기준값' 키워드가 있는 헤더 행 찾기
+    # 상위 15개 행 스캔하여 헤더 위치 탐색
     for r_idx, row in df.head(15).iterrows():
         for c_idx, val in enumerate(row):
             val_str = str(val).upper().strip() if pd.notna(val) else ""
-            if time_col_idx is None and any(k in val_str for k in TIME_KEYWORDS): 
+            
+            if date_col_idx is None and any(k in val_str for k in ["날짜", "DATE", "일자", "조회일자", "일"]): 
+                date_col_idx = c_idx
+            elif time_col_idx is None and any(k in val_str for k in ["시간", "TIME"]): 
                 time_col_idx = c_idx
+                
             if ref_col_idx is None and any(k in val_str for k in REF_KEYWORDS): 
                 ref_col_idx = c_idx
                 
-        if time_col_idx is not None and ref_col_idx is not None:
+        # 일, 시간, 기준값 열을 모두 찾으면 헤더로 인식
+        if date_col_idx is not None and time_col_idx is not None and ref_col_idx is not None:
             header_row_idx = r_idx
             break
 
-    if time_col_idx is None or ref_col_idx is None: 
-        raise ValueError("파일에서 '측정일시' 또는 '기준측정기(PM2.5)' 열을 찾지 못했습니다.")
+    if ref_col_idx is None: 
+        raise ValueError("파일에서 'KOTITI' 등 기준측정기 열을 찾지 못했습니다.")
+    if date_col_idx is None or time_col_idx is None:
+        raise ValueError("파일에서 '일' 또는 '시간' 열을 찾지 못했습니다.")
 
     ref_data = {}
     
-    # 실제 데이터가 있는 부분(헤더 다음 줄)부터 순회
+    # 🟢 2. 실제 데이터 행 처리
     for _, row in df.iloc[header_row_idx + 1:].iterrows():
-        raw_time = row[time_col_idx]
+        # 빈칸이거나 결측치면 건너뜀
+        if pd.isna(row[date_col_idx]) or pd.isna(row[time_col_idx]) or pd.isna(row[ref_col_idx]):
+            continue
+            
+        raw_date_str = str(row[date_col_idx]).strip()
+        raw_time_str = str(row[time_col_idx]).strip()
         raw_val = row[ref_col_idx]
         
-        norm_time = parse_datetime_value(raw_time)
-        if norm_time:
-            try: 
+        # "29일"에서 숫자만 추출 -> 29
+        day_match = re.search(r'\d+', raw_date_str)
+        # "0", "1" 등 시간에서 숫자만 추출
+        hour_match = re.search(r'\d+', raw_time_str)
+        
+        if day_match and hour_match:
+            try:
+                day = int(day_match.group())
+                hour = int(hour_match.group())
+                
+                # 파일명에서 얻은 연/월과 엑셀의 일/시간을 결합하여 완벽한 DB 날짜 형식 생성
+                norm_time = f"{file_year}-{file_month:02d}-{day:02d} {hour:02d}:00:00"
+                
+                # 기준값 추가
                 ref_data[norm_time] = float(raw_val)
-            except (ValueError, TypeError): 
+            except (ValueError, TypeError):
                 pass
                 
     return ref_data
@@ -163,7 +181,6 @@ def apply_calibration(sensor_index, scale_pm25, offset_pm25):
     if idx_str not in calib_data: 
         calib_data[idx_str] = {"scale": [1.0, 1.0, 1.0], "offset": [0.0, 0.0, 0.0]}
     
-    # PM2.5 (인덱스 1)의 Scale, Offset 업데이트
     calib_data[idx_str]["scale"][1] = round(scale_pm25, 4)
     calib_data[idx_str]["offset"][1] = round(offset_pm25, 4)
     
@@ -209,15 +226,14 @@ def run(sensor_index=0, ref_file_name=None):
     apply_calibration(sensor_index, scale, offset)
     print("\n✔ sensor_calibration.json 파일에 새 보정값이 반영되었습니다.")
     
-    # 3. 운영 상 주의사항(Hot-reload) 안내 메시지 추가
     print("==================================================")
     print("⚠️ 안내: 메인 모니터링 프로그램이 현재 실행 중인 경우,")
-    print("   업데이트된 보정값을 화면에 적용하려면 메인 프로그램을")
-    print("   종료했다가 다시 실행해 주시기 바랍니다.")
+    print("   업데이트된 보정값을 화면에 적용하려면 메인 프로그램의")
+    print("   [🔄 외부 보정값 파일 새로고침] 버튼을 눌러주세요.")
     print("==================================================")
 
 if __name__ == "__main__":
-    TARGET_SENSOR = 0  # 0부터 시작하므로 '센서 1'을 의미합니다.
+    TARGET_SENSOR = 0 
     SPECIFIED_FILE = ""
     
     target_file = SPECIFIED_FILE if SPECIFIED_FILE else find_reference_file(BASE_DIR)
