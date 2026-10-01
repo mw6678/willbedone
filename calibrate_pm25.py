@@ -233,7 +233,6 @@ def run(sensor_index=0, ref_file_name=None):
     print("==================================================")
 
 if __name__ == "__main__":
-    TARGET_SENSOR = 0 
     SPECIFIED_FILE = ""
     
     target_file = SPECIFIED_FILE if SPECIFIED_FILE else find_reference_file(BASE_DIR)
@@ -241,4 +240,6 @@ if __name__ == "__main__":
         print("❌ 기준 데이터를 담은 엑셀(.xls, .xlsx) 또는 CSV 파일을 찾을 수 없습니다.")
         sys.exit(1)
         
-    run(sensor_index=TARGET_SENSOR, ref_file_name=target_file)
+    # 0부터 3까지(총 4개) 알아서 반복하며 run 함수를 실행합니다.
+    for i in range(4):
+        run(sensor_index=i, ref_file_name=target_file)
