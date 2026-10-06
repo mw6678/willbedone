@@ -136,13 +136,12 @@ def load_reference_file(file_path):
                 day = int(day_match.group())
                 hour = int(hour_match.group())
                 
-                # 🚀 [핵심 수정 1] 24시 처리 및 1시간 시차(Time-ending -> Time-beginning) 교정 적용
+                # 24시 처리 및 1시간 시차 교정 적용
                 if hour == 24:
                     dt_obj = datetime(file_year, file_month, day, 0) + timedelta(days=1)
                 else:
                     dt_obj = datetime(file_year, file_month, day, hour)
                     
-                # 기준기는 측정이 끝난 시간을 기록하므로 1시간을 빼서 센서의 시작 시간과 맞춤
                 dt_obj -= timedelta(hours=1)
                 norm_time = dt_obj.strftime("%Y-%m-%d %H:00:00")
                 
@@ -152,21 +151,83 @@ def load_reference_file(file_path):
                 
     return ref_data
 
-def calculate_regression(x_vals, y_vals):
+def calc_lin_reg(x_vals, y_vals):
+    """단일 구간에 대한 선형 회귀 분석 (Scale, Offset 반환)"""
     n = len(x_vals)
+    if n < 2: 
+        return 1.0, 0.0 # 최소 2개 이상의 데이터가 없으면 계산 불가
+    
     mean_x, mean_y = sum(x_vals) / n, sum(y_vals) / n
     ss_xx = sum((x - mean_x) ** 2 for x in x_vals)
-    ss_yy = sum((y - mean_y) ** 2 for y in y_vals)
     ss_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_vals, y_vals))
+    
     if ss_xx == 0: 
-        raise ValueError("센서 값의 변동폭이 없어 회귀 계산이 불가능합니다.")
+        return 1.0, mean_y - mean_x
         
     scale = ss_xy / ss_xx
     offset = mean_y - (scale * mean_x)
-    r2 = (ss_xy / math.sqrt(ss_xx * ss_yy)) ** 2 if ss_yy != 0 else 0.0
-    return scale, offset, r2
+    return scale, offset
 
-def apply_calibration(sensor_index, scale_pm25, offset_pm25):
+def calculate_piecewise_regression(x_vals, y_vals):
+    """
+    🚀 [핵심 로직] 저농도/고농도 분리 보정값 최적화 알고리즘
+    임계값(TH)을 2.0부터 10.0까지 변경해가며 가장 오차율(MAPE)이 적고 ±30% 합격률이 높은 5개의 파라미터를 찾습니다.
+    """
+    best_pass = -1
+    best_mape = float('inf')
+    best_params = (4.0, 1.0, 0.0, 1.0, 0.0) # (th, ls, lo, hs, ho) 기본값
+    
+    # 평가할 임계값 후보군 (2.0 ~ 10.0까지 0.5 단위로 탐색)
+    thresholds = [th / 10.0 for th in range(20, 105, 5)]
+    
+    for th in thresholds:
+        low_x, low_y, high_x, high_y = [], [], [], []
+        
+        for x, y in zip(x_vals, y_vals):
+            if x < th:
+                low_x.append(x)
+                low_y.append(y)
+            else:
+                high_x.append(x)
+                high_y.append(y)
+        
+        # 각 구간별 보정 계수 산출
+        ls, lo = calc_lin_reg(low_x, low_y) if len(low_x) >= 2 else (1.0, 0.0)
+        hs, ho = calc_lin_reg(high_x, high_y) if len(high_x) >= 2 else (1.0, 0.0)
+        
+        # 데이터 쏠림 현상 방어 (한쪽 구간에 데이터가 없으면 다른 쪽 값 차용)
+        if len(low_x) < 2 and len(high_x) >= 2:
+            ls, lo = hs, ho
+        elif len(high_x) < 2 and len(low_x) >= 2:
+            hs, ho = ls, lo
+        elif len(low_x) < 2 and len(high_x) < 2:
+            ls, lo = calc_lin_reg(x_vals, y_vals)
+            hs, ho = ls, lo
+            
+        # 성능 평가 (30% 이내 통과 개수 및 평균 오차율)
+        pass_count = 0
+        errors = []
+        for x, y in zip(x_vals, y_vals):
+            pred = (x * ls + lo) if x < th else (x * hs + ho)
+            err = abs((pred - y) / y) * 100
+            errors.append(err)
+            if err <= 30.0:
+                pass_count += 1
+                
+        mape = sum(errors) / len(errors) if errors else float('inf')
+        
+        # 더 나은 성능을 찾았을 경우 갱신
+        if pass_count > best_pass or (pass_count == best_pass and mape < best_mape):
+            best_pass = pass_count
+            best_mape = mape
+            best_params = (th, ls, lo, hs, ho)
+            
+    return best_params, best_pass, best_mape, len(x_vals)
+
+def apply_calibration(sensor_index, best_params):
+    th, ls, lo, hs, ho = best_params
+    
+    # 1. JSON 파일 덮어쓰기 (메인 프로그램 실시간 연동용)
     calib_data = {}
     if os.path.exists(CALIB_FILE):
         try:
@@ -176,21 +237,44 @@ def apply_calibration(sensor_index, scale_pm25, offset_pm25):
             pass
             
     idx_str = str(sensor_index)
-    if idx_str not in calib_data: 
-        calib_data[idx_str] = {"scale": [1.0, 1.0, 1.0], "offset": [0.0, 0.0, 0.0]}
     
-    calib_data[idx_str]["scale"][1] = round(scale_pm25, 4)
-    calib_data[idx_str]["offset"][1] = round(offset_pm25, 4)
+    # 이전 버전의 단일 scale/offset 포맷이거나 없으면 새 구간별 포맷으로 초기화
+    if idx_str not in calib_data or "threshold" not in calib_data[idx_str]: 
+        calib_data[idx_str] = {
+            "threshold": [4.0, 4.0, 4.0],
+            "low_scale": [1.0, 1.0, 1.0], "low_offset": [0.0, 0.0, 0.0],
+            "high_scale": [1.0, 1.0, 1.0], "high_offset": [0.0, 0.0, 0.0]
+        }
+    
+    # PM2.5 (인덱스 1) 위치의 값만 교체
+    calib_data[idx_str]["threshold"][1] = round(th, 2)
+    calib_data[idx_str]["low_scale"][1] = round(ls, 4)
+    calib_data[idx_str]["low_offset"][1] = round(lo, 4)
+    calib_data[idx_str]["high_scale"][1] = round(hs, 4)
+    calib_data[idx_str]["high_offset"][1] = round(ho, 4)
     
     temp_file = CALIB_FILE + ".tmp"
     with open(temp_file, "w", encoding="utf-8") as f: 
         json.dump(calib_data, f, ensure_ascii=False, indent=2)
     os.replace(temp_file, CALIB_FILE)
 
+    # 🚀 2. CSV에 도출된 보정값 누적 기록 남기기 (이력 관리용 - 컬럼 확장됨)
+    history_file = os.path.join(BASE_DIR, "Data", "calibration_history.csv")
+    file_exists = os.path.exists(history_file)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    try:
+        with open(history_file, "a", encoding="utf-8-sig") as f:
+            if not file_exists:
+                f.write("적용일시,센서번호,TH,Low_Scale,Low_Offset,High_Scale,High_Offset\n")
+            f.write(f"{timestamp},센서 {sensor_index + 1},{th:.1f},{ls:.4f},{lo:.4f},{hs:.4f},{ho:.4f}\n")
+    except Exception as e:
+        print(f"⚠️ 히스토리 CSV 저장 중 오류 발생: {e}")
+
 def run(sensor_index=0, ref_file_name=None):
     ref_path = os.path.join(BASE_DIR, ref_file_name)
     print(f"\n==================================================")
-    print(f"       [센서 {sensor_index + 1}] PM2.5 자동 교정 시작")
+    print(f"       [센서 {sensor_index + 1}] PM2.5 구간별 보정 최적화")
     print(f"==================================================")
     
     try: 
@@ -210,23 +294,26 @@ def run(sensor_index=0, ref_file_name=None):
         if time_bucket in ref_hourly:
             r_val = ref_hourly[time_bucket]
             
-            # 🚀 [핵심 수정 2] 5 이하의 저농도 데이터는 노이즈로 간주하여 필터링
-            if s_val > 5 and r_val > 5:
+            # 기준기 값이 5 이상인 경우만 최적화에 사용
+            if r_val >= 5:
                 matched_x.append(s_val)
                 matched_y.append(r_val)
                 
     if len(matched_x) < 5: 
-        print("❌ DB 데이터와 기준측정기 엑셀의 시간대가 일치하는 매칭 데이터가 5개 미만입니다.")
+        print("❌ 유효한 매칭 데이터가 5개 미만입니다.")
         return
         
-    scale, offset, r2 = calculate_regression(matched_x, matched_y)
-    print(f"\n▶ 유효 매칭 시간대: {len(matched_x)}시간 (5 ㎍/㎥ 이하 노이즈 제외)")
-    print(f"▶ 획득 Scale: {scale:.4f}")
-    print(f"▶ 획득 Offset: {offset:.4f}")
-    print(f"▶ 결정계수 (R²): {r2:.4f}")
+    best_params, pass_count, mape, total_count = calculate_piecewise_regression(matched_x, matched_y)
+    th, ls, lo, hs, ho = best_params
     
-    apply_calibration(sensor_index, scale, offset)
-    print("\n✔ sensor_calibration.json 파일에 새 보정값이 반영되었습니다.")
+    print(f"▶ 유효 매칭 시간대: {total_count}시간 (기준기 5 ㎍/㎥ 미만 제외)")
+    print(f"▶ 탐색된 최적 임계값(TH) : {th:.1f}")
+    print(f"▶ 저농도(<TH) 보정식   : (원본 × {ls:.4f}) + {lo:.4f}")
+    print(f"▶ 고농도(>=TH) 보정식  : (원본 × {hs:.4f}) + {ho:.4f}")
+    print(f"▶ 예상 검사 결과        : 합격 {pass_count}건 / {total_count}건 (평균오차율 {mape:.1f}%)")
+    
+    apply_calibration(sensor_index, best_params)
+    print("\n✔ JSON 파일 및 CSV 히스토리에 새 보정값이 반영되었습니다.")
     
     print("==================================================")
     print("⚠️ 안내: 메인 모니터링 프로그램이 현재 실행 중인 경우,")
